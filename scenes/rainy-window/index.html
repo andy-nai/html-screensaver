@@ -46,7 +46,7 @@ const DEFAULTS = {
   lightning: { everyMinutes: 6, chance: .3 },
   frame: { show: true, colors: { wood: '#2a1e1c', edge: '#3e2c28', sill: '#352624', sillTop: '#4a3430' } },
   candle: { show: true, colors: { wax: '#efe6d6', flame: '#ffd27a', glow: '#ff9a40' } },
-  cat: { everyMinutes: 10, chance: .3, sitSeconds: [20, 45], size: .34, colors: { coats: ['#141016', '#141016', '#4a4a52', '#a85a2a', '#6a5040'] } },
+  cat: { sitSeconds: [20, 45], size: .34, colors: { coats: ['#141016', '#141016', '#4a4a52', '#a85a2a', '#6a5040'] } },
   clock: { show: true, hour12: false, seconds: false, position: 'auto', font: 'segment', size: 1,
     blinkColon: true, drift: true, glow: 1, colors: { text: '#ff4030', glow: '#ff2a1a', box: '#161214' } },
 };
@@ -64,6 +64,10 @@ function mergeConfig(base, over, path = '') {
 }
 const CFG = mergeConfig(DEFAULTS, window.RAIN_CONFIG);
 const FRAME_INTERVAL = CFG.display.frameRate > 0 ? 1000 / CFG.display.frameRate : 0;
+
+// Rare visitors: checked once a minute with a 1-in-30 chance, so about once every 30 minutes but
+// never predictably. When a visitor has a variant (Shift+X), 1 visit in 10 is the variant.
+const RARE_CHECK_MS = 60 * 1000, RARE_CHANCE = 1 / 30, RARE_VARIANT = 1 / 10;
 
 /* ------------------------------------------------------------------
  * Helpers
@@ -317,7 +321,7 @@ function stepRunners(S, t, dt) {
   const g = S.glass, life = 40000;
   S.runners = S.runners.filter(rn => {
     if (t < rn.pauseUntil) return true;
-    const v = (8 + rn.r / S.k * 9) * S.k / 1000;
+    const v = (8 + rn.r / S.k * 9) * S.k / 1000 * (rn.slow || 1);
     rn.y += v * dt;
     rn.x += Math.sin(rn.y * .25 + rn.ph) * .06 * S.k + (Math.random() - .5) * .08 * S.k;
     if (Math.random() < dt / 1000 * .7) rn.pauseUntil = t + 150 + Math.random() * 900;          // stick for a moment
@@ -602,9 +606,11 @@ function dropRuns(S, t) {
 /* ------------------------------------------------------------------
  * A rare visitor: a cat jumps up onto the sill, sits watching the rain, then jumps down again
  * ------------------------------------------------------------------ */
-const CAT_JUMP_MS = 650;
+const CAT_JUMP_MS = 1000;
 
-function spawnCat(S, t) {
+// The variant: while it sits, raindrops run down the glass in front of it and it reaches up and paws at
+// them, following each one down.
+function spawnCat(S, t, chase = Math.random() < RARE_VARIANT) {
   if (S.cat || !CFG.frame.show) return;
   const C = CFG.cat, h = Math.round((S.glass.y1 - S.glass.y0) * C.size);
   // a spot on the sill clear of the candle and the clock
@@ -615,30 +621,70 @@ function spawnCat(S, t) {
     if (busy.every(v => Math.abs(v - cx) > h * .55 + 12 * S.k)) { x = cx; break; }
   }
   const coat = hexRgb(C.colors.coats[Math.floor(Math.random() * C.colors.coats.length)]).map(v => v * .65);
-  S.cat = { x: Math.round(x), h, coat, t0: t, state: 'up', ph: Math.random() * TAU, tailSide: Math.random() < .5 ? 1 : -1,
-    sitMs: (C.sitSeconds[0] + Math.random() * (C.sitSeconds[1] - C.sitSeconds[0])) * 1000 };
+  S.cat = { x: Math.round(x), h, coat, t0: t, state: 'up', ph: Math.random() * TAU, tailSide: Math.random() < .5 ? 1 : -1, from: Math.random() < .5 ? 1 : -1,
+    sitMs: Math.max(chase ? 22000 : 0, (C.sitSeconds[0] + Math.random() * (C.sitSeconds[1] - C.sitSeconds[0])) * 1000),
+    chase, pawSide: Math.random() < .5 ? 1 : -1, drop: null, drops: 0, nextDrop: 0 };
 }
 
 function stepCat(S, t) {
   const c = S.cat, age = t - c.t0;
+  if (c.chase && c.state === 'sit') {
+    if (c.drop && !S.runners.includes(c.drop)) { c.drop = null; c.nextDrop = t + 1500; }   // that one got away
+    if (!c.drop && c.drops < 3 && age > 2500 && t > c.nextDrop && age < c.sitMs - 6000) {
+      // a fat drop just above and beside its head, running down slowly enough to chase
+      const feet = S.glass.y1 + Math.round(2 * S.k);
+      if (S.runners.length > 8) S.runners.shift();
+      startRunner(S, c.x + c.pawSide * c.h * .3, feet - c.h * 1.2, 2.6 * S.k, t);
+      c.drop = S.runners.at(-1);
+      c.drop.slow = .3; c.drop.pauseUntil = t + 1200;
+      c.drops++;
+    }
+  }
   if (c.state === 'up' && age > CAT_JUMP_MS) { c.state = 'sit'; c.t0 = t; }
   else if (c.state === 'sit' && age > c.sitMs) { c.state = 'down'; c.t0 = t; }
   else if (c.state === 'down' && age > CAT_JUMP_MS) S.cat = null;
 }
 
+// Where the cat is and how it's stretched at this moment of a jump.
+// lift = how far above the sill its feet are (negative = below), sx/sy = squash and stretch,
+// hang = how much the tail trails below it instead of lying along the sill.
+function catPose(S, c, t) {
+  if (c.state === 'sit') return { dx: 0, lift: 0, sx: 1, sy: 1, hang: 0 };
+  const feet = S.glass.y1 + Math.round(2 * S.k), h = c.h;
+  const below = S.H - feet + h * 1.4;                       // far enough down to be off the screen
+  const p = Math.min(1, (t - c.t0) / CAT_JUMP_MS), ease = q => 1 - (1 - q) ** 2;
+  if (c.state === 'up') {
+    if (p < .5) {                                           // leaping up from the floor, stretched out
+      const q = p / .5;
+      return { dx: c.from * h * .55 * (1 - ease(q)), lift: -below * (1 - ease(q)) + Math.sin(q * Math.PI) * h * .12,
+        sx: .8, sy: 1.25 - .1 * q, hang: 1 };
+    }
+    if (p < .72) {                                          // landing: a quick crouch
+      const q = (p - .5) / .22, s = Math.sin(q * Math.PI);
+      return { dx: 0, lift: 0, sx: 1 + .14 * s, sy: 1 - .2 * s, hang: 1 - q };
+    }
+    const q = (p - .72) / .28;                              // settling into the sit
+    return { dx: 0, lift: 0, sx: 1, sy: 1 + .03 * Math.sin(q * Math.PI), hang: 0 };
+  }
+  if (p < .3) {                                             // getting ready: crouch
+    const q = p / .3;
+    return { dx: 0, lift: 0, sx: 1 + .12 * q, sy: 1 - .18 * q, hang: .3 * q };
+  }
+  const q = (p - .3) / .7;                                  // springing off and dropping out of sight
+  return { dx: c.from * h * .55 * q * q, lift: Math.sin(Math.min(1, q * 1.6) * Math.PI) * h * .15 - below * q * q,
+    sx: .82, sy: 1.22, hang: 1 };
+}
+
 // A sitting cat seen from behind, as a pixel mask: body, shoulders, head, ears and tail
 function drawCat(b, S, t) {
-  const c = S.cat, h = c.h, feet = S.glass.y1 + Math.round(2 * S.k), age = t - c.t0;
-  // jumping: rises from below the bottom of the screen in an arc, or drops back down
-  let lift = 0;
-  if (c.state !== 'sit') {
-    const p = Math.min(1, age / CAT_JUMP_MS), q = c.state === 'up' ? 1 - p : p;
-    lift = -(S.H - feet + h) * q * q + Math.sin(q * Math.PI) * h * .25;
-  }
-  const by = feet - lift;                                   // bottom of the cat
+  const c = S.cat, h = c.h, feet = S.glass.y1 + Math.round(2 * S.k);
+  const pose = catPose(S, c, t), sitting = c.state === 'sit';
+  const by = feet - pose.lift, cx0 = Math.round(c.x + pose.dx);
   // little movements while it sits: looking about, an ear twitch, the tail tip flicking
-  const look = Math.round(Math.sin(t * .0005 + c.ph) * Math.max(0, Math.sin(t * .00023 + c.ph * 2)) * h * .05);
-  const twitch = Math.sin(t * .0031 + c.ph) > .97 ? 1 : 0;
+  const paw = sitting ? catPaw(S, c, t, feet) : null;
+  const look = paw ? Math.round(paw.side * h * .05)          // watching the drop
+    : sitting ? Math.round(Math.sin(t * .0005 + c.ph) * Math.max(0, Math.sin(t * .00023 + c.ph * 2)) * h * .05) : 0;
+  const twitch = sitting && Math.sin(t * .0031 + c.ph) > .97 ? 1 : 0;
   const flick = Math.sin(t * .0021 + c.ph) * Math.sin(t * .0006);
   const inEll = (x, y, cx, cy, rx, ry) => ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1;
   const inTri = (x, y, ax, ay, bx, by2, cx, cy) => {
@@ -647,39 +693,61 @@ function drawCat(b, S, t) {
     return s1 >= 0 && s2 >= 0 && s1 + s2 <= 1;
   };
   const headX = look, headY = -h * .78;
-  const inside = (x, y) =>                                  // x, y relative to the cat's bottom centre (y up is negative)
+  const body = (x, y) =>                                    // in the cat's own frame: bottom centre, y up is negative
     inEll(x, y, 0, -h * .27, h * .3, h * .28) ||                                   // haunches
-    (y > -h * .3 && y <= 0 && Math.abs(x) <= h * .28 - Math.max(0, y + h * .04) * 1.2) || // flat bottom on the sill
+    (y > -h * .3 && y <= 0 && Math.abs(x) <= h * .28 - Math.max(0, y + h * .04) * 1.2) || // flat bottom
     inEll(x, y, 0, -h * .52, h * .2, h * .2) ||                                     // back and shoulders
     inEll(x, y, headX, headY, h * .155, h * .14) ||                                 // head
     inTri(x, y, headX - h * .15, headY - h * .04, headX - h * .04, headY - h * .12, headX - h * (.13 + .02 * twitch), headY - h * .25) ||
     inTri(x, y, headX + h * .15, headY - h * .04, headX + h * .04, headY - h * .12, headX + h * .13, headY - h * .25);
-  // the tail lies along the sill, its tip curling up and flicking
-  const tail = [];
-  const ts = c.tailSide, tw = Math.max(1.5, h * .05);
+  const inside = (x, y) => body(x / pose.sx, y / pose.sy);  // squash and stretch
+  // the tail: lying along the sill with its tip flicking, or trailing below while it jumps
+  const tail = [], ts = c.tailSide, tw = Math.max(1.5, h * .05);
   for (let i = 0; i <= 24; i++) {
     const u = i / 24;
-    const tx = ts * (h * .22 + u * h * .42);
-    const ty = -tw * .8 - (u > .6 ? (u - .6) / .4 * h * (.12 + .1 * flick) : 0);
-    tail.push([tx, ty]);
+    const lyX = ts * (h * .22 + u * h * .42), lyY = -tw * .8 - (u > .6 ? (u - .6) / .4 * h * (.12 + .1 * flick) : 0);
+    const hgX = ts * (h * .12 + Math.sin(u * 2.2) * h * .1), hgY = -h * .05 + u * h * .5;
+    tail.push([lyX + (hgX - lyX) * pose.hang, lyY + (hgY - lyY) * pose.hang]);
   }
   const inTail = (x, y) => tail.some(([tx, ty]) => (x - tx) ** 2 + (y - ty) ** 2 <= tw * tw);
+  // a foreleg reaching up from the shoulder to the drop, with a round paw at the end
+  const pw = h * .045;
+  const inPaw = !paw ? () => false : (x, y) => {
+    const vx = paw.tx - paw.sx, vy = paw.ty - paw.sy, L2 = vx * vx + vy * vy || 1;
+    const u = clamp(((x - paw.sx) * vx + (y - paw.sy) * vy) / L2, 0, 1);
+    const dx = x - (paw.sx + vx * u), dy = y - (paw.sy + vy * u);
+    return dx * dx + dy * dy <= pw * pw || (x - paw.tx) ** 2 + (y - paw.ty) ** 2 <= (pw * 1.5) ** 2;
+  };
+  const solid = (x, y) => inside(x, y) || inTail(x, y) || inPaw(x, y);
 
-  const x0 = Math.floor(-h * .4), x1 = Math.ceil(h * .75), y0 = Math.floor(-h * 1.05);
+  const x0 = Math.floor(Math.min(-h * .7 * pose.sx, paw ? paw.tx - pw * 2 : 0)), x1 = Math.ceil(Math.max(h * .75 * pose.sx, paw ? paw.tx + pw * 2 : 0));
+  const y0 = Math.floor(Math.min(-h * 1.05 * pose.sy, paw ? paw.ty - pw * 2 : 0)), y1 = Math.ceil(h * .5);
   const coat = rgba(c.coat, 1);
   const rimSide = S.candle ? Math.sign(S.candle.x - c.x) : 0;  // candlelight catches this edge
   const rimCol = rgba(hexRgb(CFG.candle.colors.glow), .6), topCol = rgba(c.coat.map(v => Math.min(255, v * 1.4 + 25)), 1);
-  for (let y = y0; y <= 0; y++) {
+  for (let y = y0; y <= y1; y++) {
+    const sy = Math.round(by + y);
+    if (sy < 0 || sy >= S.H) continue;
     let lo = Infinity, hi = -Infinity;
     for (let x = x0; x <= x1; x++) {
-      if (!(inside(x, y) || inTail(x, y))) continue;
-      const sx = c.x + x, sy = Math.round(by + y);
-      b.fillStyle = !(inside(x, y - 1) || inTail(x, y - 1)) ? topCol : coat;   // a faint highlight along the top edges
-      b.fillRect(sx, sy, 1, 1);
+      if (!solid(x, y)) continue;
+      b.fillStyle = !solid(x, y - 1) ? topCol : coat;       // a faint highlight along the top edges
+      b.fillRect(cx0 + x, sy, 1, 1);
       lo = Math.min(lo, x); hi = Math.max(hi, x);
     }
-    if (rimSide && hi >= lo) { b.fillStyle = rimCol; b.fillRect(c.x + (rimSide > 0 ? hi : lo), Math.round(by + y), 1, 1); }
+    if (rimSide && hi >= lo) { b.fillStyle = rimCol; b.fillRect(cx0 + (rimSide > 0 ? hi : lo), sy, 1, 1); }
   }
+}
+
+// The reaching paw, in the cat's own frame (bottom centre, y up negative), when there's a drop within reach
+function catPaw(S, c, t, feet) {
+  const rn = c.drop;
+  if (!rn || !S.runners.includes(rn)) return null;
+  const sx = c.pawSide * c.h * .14, sy = -c.h * .55;           // shoulder
+  const tx = rn.x - c.x, ty = rn.y + rn.r - feet;               // just under the drop
+  if (ty > -c.h * .3 || Math.hypot(tx - sx, ty - sy) > c.h * .85) return null;   // out of reach: paw down
+  const reach = .86 + .14 * Math.max(0, Math.sin(t * .012));  // tap, tap
+  return { side: c.pawSide, sx, sy, tx: sx + (tx - sx) * reach, ty: sy + (ty - sy) * reach };
 }
 
 // cars move at a steady speed in depth, so they creep along far away and rush past close up
@@ -754,9 +822,9 @@ function tick(S, t) {
     S.lastRoll.flash = t;
     if (Math.random() < CFG.lightning.chance) S.flash = t;
   }
-  if (t - S.lastRoll.cat > CFG.cat.everyMinutes * 60000) {
+  if (t - S.lastRoll.cat > RARE_CHECK_MS) {
     S.lastRoll.cat = t;
-    if (Math.random() < CFG.cat.chance) spawnCat(S, t);
+    if (Math.random() < RARE_CHANCE) spawnCat(S, t);
   }
   if (S.cat) stepCat(S, t);
 }
@@ -791,7 +859,7 @@ addEventListener('keydown', e => {
   if (k === 'c') addCar(scene, now);
   if (k === 'd') dropRuns(scene, now);
   // X = this scene's rare visitor (Shift+X = its variation, where it has one)
-  if (k === 'x') spawnCat(scene, now);
+  if (k === 'x') spawnCat(scene, now, e.shiftKey || undefined);
   if (!CFG.display.animate) draw(now);
 });
 

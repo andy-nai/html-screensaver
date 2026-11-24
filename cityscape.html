@@ -24,7 +24,7 @@
  * ------------------------------------------------------------------ */
 // Same shape as config.js: each section = its settings, then a `colors` block.
 const DEFAULTS = {
-  display: { targetRows: 200, animate: true, seed: null, clickToRegenerate: true },
+  display: { targetRows: 200, animate: true, frameRate: 24, seed: null, clickToRegenerate: true },
   sky: {
     colors: {
       gradient: ['#05041a', '#0a0924', '#100e30', '#17143d', '#211a4b', '#2f2058', '#432862', '#5c3068', '#7a3a68'],
@@ -110,6 +110,8 @@ const CFG = mergeConfig(DEFAULTS, window.CITYSCAPE_CONFIG);
 
 const TARGET_ROWS = CFG.display.targetRows;
 const ANIMATE = CFG.display.animate;
+// ms between drawn frames; 0 = draw on every screen refresh
+const FRAME_INTERVAL = CFG.display.frameRate > 0 ? 1000 / CFG.display.frameRate : 0;
 const WINDOW_PERIOD = CFG.windows.switchEverySeconds * 1000;
 const WINDOW_SWITCH_P = CFG.windows.switchChance;
 const WINDOW_FADE = CFG.windows.fadeSeconds * 1000;
@@ -1551,9 +1553,16 @@ function draw(t) {
   drawAbduction(ctx, scene, t, px);   // in front of everything
 }
 
+// Everything is animated from the clock, not frame counts, so drawing fewer
+// frames changes nothing but how much work is done.
+let lastDraw = -Infinity;
 function loop(t) {
-  draw(t);
   rafId = requestAnimationFrame(loop);
+  if (FRAME_INTERVAL) {
+    if (t - lastDraw < FRAME_INTERVAL - 1.5) return;          // not due yet (small tolerance for timing jitter)
+    lastDraw = Math.max(lastDraw + FRAME_INTERVAL, t - FRAME_INTERVAL); // stay on a steady beat
+  }
+  draw(t);
 }
 
 function regenerate() {

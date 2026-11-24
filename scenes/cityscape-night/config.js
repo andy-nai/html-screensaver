@@ -1,7 +1,7 @@
 // Cityscape Night — settings
 //
 // Edit values here and reload the page. Anything you delete falls back to the
-// default built into cityscape.html, so you only need to keep what you change.
+// default built into index.html, so you only need to keep what you change.
 // (This is a .js file rather than .json so it loads when the page is opened
 // straight from disk.)
 //

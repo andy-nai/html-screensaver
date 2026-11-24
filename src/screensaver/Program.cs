@@ -15,9 +15,12 @@ static class Program
         bool debug = args.Any(a => a.Equals("/debug", StringComparison.OrdinalIgnoreCase));
         string? forcedScene = args
             .FirstOrDefault(a => a.StartsWith("/scene:", StringComparison.OrdinalIgnoreCase))?[7..];
-        // /install and /uninstall (plus /quiet) are handled by Installer. Run with no arguments under any
-        // name other than *.scr (e.g. HtmlScreensaver-Setup.exe), it's the installer.
-        bool quiet = args.Any(a => a.Equals("/quiet", StringComparison.OrdinalIgnoreCase));
+        // /install and /uninstall are handled by Installer, with /allusers (everyone on this PC rather than
+        // just you) and /quiet (no window). Run with no arguments under any name other than *.scr
+        // (e.g. HtmlScreensaver-Setup.exe), it's the installer.
+        bool Flag(string f) => args.Any(a => a.Equals(f, StringComparison.OrdinalIgnoreCase));
+        bool quiet = Flag("/quiet"), allUsers = Flag("/allusers"), autoStart = Flag("/auto");
+        string? tempCopy = args.FirstOrDefault(a => a.StartsWith("/tempcopy:", StringComparison.OrdinalIgnoreCase))?[10..].Trim('"');
         bool isScr = Path.GetExtension(Environment.ProcessPath ?? "").Equals(".scr", StringComparison.OrdinalIgnoreCase);
         string mode = isScr ? "c" : "install";
 
@@ -27,16 +30,16 @@ static class Program
             int colon = mode.IndexOf(':');
             if (colon >= 0) mode = mode[..colon];
             if (mode == "debug" || mode == "scene") mode = "s";
-            if (mode == "quiet") mode = isScr ? "c" : "install";
+            if (mode is "quiet" or "allusers" or "auto") mode = isScr ? "c" : "install";
         }
 
         switch (mode)
         {
             case "install":
-                Installer.Install(quiet);
+                Installer.Install(quiet, allUsers, autoStart);
                 break;
             case "uninstall":
-                Installer.Uninstall(quiet);
+                Installer.Uninstall(quiet, allUsers, tempCopy);
                 break;
             case "s":
                 RunScreensaver(debug, forcedScene);
@@ -93,15 +96,18 @@ static class Program
 
 static class Config
 {
-    // The scenes folder lives next to the executable. Run from anywhere else (e.g. the setup exe with
-    // /debug), it falls back to the installed copy's scenes.
+    // The scenes folder lives next to the executable. Run from anywhere else (the copy in System32 for an
+    // install for everyone, or the setup exe with /debug), it uses an installed copy's scenes: yours if
+    // you have one, otherwise the one installed for everyone.
     public static string AppDir => Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory;
     public static string ScenesDir
     {
         get
         {
             string local = Path.Combine(AppDir, "scenes");
-            return Directory.Exists(local) ? local : Path.Combine(Installer.InstallDir, "scenes");
+            if (Directory.Exists(local)) return local;
+            string mine = Path.Combine(Installer.InstallDir(InstallScope.User), "scenes");
+            return Directory.Exists(mine) ? mine : Path.Combine(Installer.InstallDir(InstallScope.AllUsers), "scenes");
         }
     }
 

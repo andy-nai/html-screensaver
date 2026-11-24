@@ -76,6 +76,7 @@ Layout of the source tree:
 
 ```
 src\screensaver\     C# project: the screensaver and its built-in installer
+                     (app.ico is drawn by make-icon.py: python make-icon.py to redraw it)
 .github\workflows\   release.yml, builds and publishes the installer
 scenes\              scenes, bundled into the installer
 build.ps1            builds dist\HtmlScreensaver-Setup.exe

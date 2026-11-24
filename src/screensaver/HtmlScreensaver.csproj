@@ -13,6 +13,8 @@
     <Version>1.0.0</Version>
     <Product>HTML Screensaver</Product>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <!-- drawn by make-icon.py; shown on the setup exe, the .scr, the installer window and Installed apps -->
+    <ApplicationIcon>app.ico</ApplicationIcon>
 
     <!-- Keep the output lean -->
     <InvariantGlobalization>true</InvariantGlobalization>

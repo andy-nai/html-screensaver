@@ -62,7 +62,7 @@ const DEFAULTS = {
     },
   },
   gulls: { everySeconds: 20, chance: .5, colors: { body: '#2a2034' } },
-  whale: { everyMinutes: 12, chance: .3, colors: { body: '#2c2a3c', spout: '#e8eef8' } },
+  whale: { colors: { body: '#2c2a3c', spout: '#e8eef8' } },
   pier: { colors: { deck: '#6a4c3c', plank: '#563c30', post: '#33231e', lamp: '#ffd890' } },
   nightTint: { color: '#0a1030', amount: .55 },
   clock: { show: true, hour12: false, seconds: false, position: 'auto', font: 'pixel', size: 1,
@@ -82,6 +82,10 @@ function mergeConfig(base, over, path = '') {
 }
 const CFG = mergeConfig(DEFAULTS, window.HARBOUR_CONFIG);
 const FRAME_INTERVAL = CFG.display.frameRate > 0 ? 1000 / CFG.display.frameRate : 0;
+
+// Rare visitors: checked once a minute with a 1-in-30 chance, so about once every 30 minutes but
+// never predictably. When a visitor has a variant (Shift+X), 1 visit in 10 is the variant.
+const RARE_CHECK_MS = 60 * 1000, RARE_CHANCE = 1 / 30, RARE_VARIANT = 1 / 10;
 
 /* ------------------------------------------------------------------
  * Helpers: RNG, colour, dithering, noise
@@ -409,19 +413,29 @@ function spawnGulls(S, t) {
 }
 
 // A rare visitor: a whale far out in the bay spouts, shows its back, then lifts its tail and dives
-const WHALE_MS = 15000;
-function spawnWhale(S, t) {
+// (the variant: a mother and her calf, surfacing together)
+const WHALE_MS = 15000, CALF_LAG = 900;
+function spawnWhale(S, t, calf = Math.random() < RARE_VARIANT) {
   if (S.whale) return;
   const [a, b] = S.openX, dir = Math.random() < .5 ? 1 : -1;
-  S.whale = { x: a + (b - a) * (.25 + Math.random() * .5), y: S.horizon + Math.round((5 + Math.random() * 7) * S.k), dir, t0: t };
+  S.whale = { x: a + (b - a) * (.25 + Math.random() * .5), y: S.horizon + Math.round((5 + Math.random() * 7) * S.k), dir, t0: t, calf };
 }
 
 function drawWhale(b, S, t, dark) {
-  const wh = S.whale, a = t - wh.t0, k = S.k;
-  if (a > WHALE_MS) { S.whale = null; return; }
+  const wh = S.whale, a = t - wh.t0;
+  if (a > WHALE_MS + (wh.calf ? CALF_LAG : 0)) { S.whale = null; return; }
+  const x = wh.x + wh.dir * a * .0012 * S.k;
+  // the calf keeps close behind its mother, a beat behind her
+  if (wh.calf) drawOneWhale(b, S, t, dark, a - CALF_LAG, Math.round(x - wh.dir * 24 * S.k), wh.y, wh.dir, S.k * .55);
+  drawOneWhale(b, S, t, dark, a, Math.round(x), wh.y, wh.dir, S.k);
+}
+
+// One whale's surfacing, `a` ms in, centred on (cx, wy); k sets its size
+function drawOneWhale(b, S, t, dark, a, cx, wy, dir, k) {
+  if (a < 0 || a > WHALE_MS) return;
+  const wh = { dir };
   const WC = CFG.whale.colors;
   const body = mixHex(WC.body, CFG.nightTint.color, dark * .5), lit = mixHex(WC.body, '#ffffff', .25 * (1 - dark) + .08);
-  const cx = Math.round(wh.x + wh.dir * a * .0012 * k), wy = wh.y;
   const ease = (p0, p1) => clamp((a - p0) / (p1 - p0), 0, 1);
   const bump = (p0, p1) => Math.sin(ease(p0, p1) * Math.PI);
   const foam = (x0, w) => {                                // white water where it breaks the surface
@@ -826,9 +840,9 @@ function tick(S, t) {
     S.lastRoll.gull = t;
     if (Math.random() < G.chance * (1 - darkness(S, t))) spawnGulls(S, t);
   }
-  if (t - S.lastRoll.whale > CFG.whale.everyMinutes * 60000) {
+  if (t - S.lastRoll.whale > RARE_CHECK_MS) {
     S.lastRoll.whale = t;
-    if (Math.random() < CFG.whale.chance) spawnWhale(S, t);
+    if (Math.random() < RARE_CHANCE) spawnWhale(S, t);
   }
 }
 
@@ -862,7 +876,7 @@ addEventListener('keydown', e => {
   if (k === 'g') spawnGulls(scene, now);
   if (k === 't') scene.tOff += scene.cycle / 2;
   // X = this scene's rare visitor (Shift+X = its variation, where it has one)
-  if (k === 'x') spawnWhale(scene, now);
+  if (k === 'x') spawnWhale(scene, now, e.shiftKey || undefined);
   if (!CFG.display.animate) draw(now);
 });
 

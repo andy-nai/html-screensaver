@@ -1,0 +1,1602 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cityscape Night</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #07061a; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; image-rendering: pixelated; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="city"></canvas>
+<!-- optional user settings; the page falls back to the defaults below if it's missing -->
+<script>
+  // load config.js fresh every time so edits always show on reload (no stale cache)
+  document.write('<script src="config.js?v=' + Date.now() + '"><\/script>');
+</script>
+<script>
+'use strict';
+
+/* ------------------------------------------------------------------
+ * Config — defaults, overridden by config.js (window.CITYSCAPE_CONFIG)
+ * ------------------------------------------------------------------ */
+// Same shape as config.js: each section = its settings, then a `colors` block.
+const DEFAULTS = {
+  display: { targetRows: 200, animate: true, seed: null, clickToRegenerate: true },
+  sky: {
+    colors: {
+      gradient: ['#05041a', '#0a0924', '#100e30', '#17143d', '#211a4b', '#2f2058', '#432862', '#5c3068', '#7a3a68'],
+      haze: '#4b2e68', moonHalo: '#8f88c4',
+    },
+  },
+  moon: {
+    pulseSeconds: 18, driftPixelsPerMinute: 2,
+    colors: { surface: '#f3edd2', shade: '#cdc39c', crater: '#b9ae88', glow: '#e9e2c8' },
+  },
+  stars: { colors: ['#4a4878', '#8481b8', '#c9c6ee', '#ffffff'] },
+  shootingStars: {
+    everyMinutes: 5, chance: .75,
+    colors: ['#ffffff', '#e4e2ff', '#a9a6dd', '#6e6aa8', '#3f3c74'],
+  },
+  clouds: {
+    clearNightChance: .4, cloudiness: [.4, 1], spacing: 24, speed: [.15, .45], spawnEverySeconds: 12,
+    colors: { body: '#2b2550', lit: '#3e3868', shade: '#221d44' },
+  },
+  buildings: {
+    count: { far: 1, mid: 1, near: 1 },
+    colors: {
+      far:  { body: ['#221b47', '#251d4c', '#281f50'], edge: '#372d66', darkWindows: null },
+      mid:  { body: ['#14112c', '#171331', '#1a1636'], edge: '#2a2453', darkWindows: '#1e1a3c' },
+      near: { body: ['#0a0918', '#0c0a1c', '#0f0c21'], edge: '#1f1a3e', darkWindows: '#16132b' },
+    },
+  },
+  windows: {
+    switchEverySeconds: 30, switchChance: .05, fadeSeconds: 3,
+    colors: {
+      warm:   { weight: 6, shades: ['#ffd36b', '#ffc84f', '#ffe29a', '#f7b54a'] },
+      cool:   { weight: 2, shades: ['#d6ecff', '#a9d4ff', '#c2e2ff'] },
+      green:  { weight: 1, shades: ['#b4ffd9', '#8ff0c4'] },
+      orange: { weight: 1, shades: ['#ffb38a', '#ff9f70'] },
+    },
+  },
+  neonSigns: {
+    colors: { tubes: ['#ff4fd8', '#3bf0ff', '#ff6a3b', '#7dff5a', '#ffe14f', '#b07bff'], body: '#0d0a1a' },
+  },
+  rooftopLights: { fadeSeconds: [8, 14], colors: { on: '#e04848', off: '#3a1424' } },
+  street: { colors: { sidewalk: '#151229', curb: '#272144', road: '#0a0915', laneMarkings: '#2c2747' } },
+  streetlights: {
+    sidewalkSpacing: [22, 34], foregroundSpacing: [38, 50],
+    colors: {
+      sidewalk:   { pole: '#3e3c4c', light: '#d4d2e2', glow: '#aeacc8' },
+      foreground: { pole: '#4a4858', hoodTop: '#6c6a7c', light: '#b6b4c8', glow: '#a3a1bf' },
+    },
+  },
+  cars: {
+    everySeconds: 15, chance: .5, speed: [9, 16], taxiChance: .12,
+    colors: {
+      bodies: ['#c0392b', '#2e86de', '#f5f6fa', '#27ae60', '#8e44ad', '#e67e22', '#7f8c8d', '#16a085', '#d35400', '#34495e'],
+      headlights: '#fff1c8', taillights: '#ff3b3b', glass: '#1c2640',
+    },
+  },
+  pedestrians: {
+    everySeconds: 8, chance: .35, speed: [2.5, 4.5],
+    colors: {
+      coats: ['#8b3a3a', '#3a5a8b', '#5a7a4a', '#7a6a5a', '#b08a4a', '#5a4a7a', '#8a8a9a', '#2a3a4a', '#a05a7a'],
+      skin:  ['#f1c9a5', '#e0ac85', '#c68863', '#9c6644', '#6b4430'],
+      hair:  ['#1e1a1a', '#4a3020', '#7a5030', '#c8a060', '#9a9aa0', '#8a3a20'],
+    },
+  },
+};
+
+// sections where config.js may add new named entries, not just change existing ones
+const OPEN_SECTIONS = new Set(['windows.colors']);
+
+function mergeConfig(base, over, path = '') {
+  const out = { ...base };
+  for (const k of Object.keys(over || {})) {
+    const b = base[k], o = over[k], p = path ? `${path}.${k}` : k;
+    if (o === undefined) continue;
+    if (!(k in base) && !OPEN_SECTIONS.has(path)) { console.warn(`config.js: unknown setting "${p}" ignored`); continue; }
+    const isGroup = v => v && typeof v === 'object' && !Array.isArray(v);
+    // merge groups key by key; anything else (number, array, or a value
+    // replacing a whole group) is taken as given
+    out[k] = isGroup(b) && isGroup(o) ? mergeConfig(b, o, p) : o;
+  }
+  return out;
+}
+const CFG = mergeConfig(DEFAULTS, window.CITYSCAPE_CONFIG);
+
+const TARGET_ROWS = CFG.display.targetRows;
+const ANIMATE = CFG.display.animate;
+const WINDOW_PERIOD = CFG.windows.switchEverySeconds * 1000;
+const WINDOW_SWITCH_P = CFG.windows.switchChance;
+const WINDOW_FADE = CFG.windows.fadeSeconds * 1000;
+const MOON_PULSE = CFG.moon.pulseSeconds * 1000;
+const MOON_DRIFT = CFG.moon.driftPixelsPerMinute;   // art px per minute
+// per row [far, mid, near]; a single number applies to all three
+const BUILDING_COUNT = (c => (typeof c === 'number' ? [c, c, c] : [c.far, c.mid, c.near])
+  .map(v => Math.min(1, Math.max(0, Number.isFinite(v) ? v : 1))))(CFG.buildings.count);
+const CLEAR_NIGHT_CHANCE = CFG.clouds.clearNightChance;
+const CLOUD_SPEED = CFG.clouds.speed;
+const CLOUD_SPAWN_EVERY = CFG.clouds.spawnEverySeconds * 1000;
+const METEOR_PERIOD = CFG.shootingStars.everyMinutes * 60 * 1000;
+const METEOR_CHANCE = CFG.shootingStars.chance;
+
+/* ------------------------------------------------------------------
+ * Seeded RNG
+ * ------------------------------------------------------------------ */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function makeRng(seed) {
+  const r = mulberry32(seed >>> 0);
+  return {
+    next: r,
+    range: (a, b) => a + r() * (b - a),
+    int: (a, b) => Math.floor(a + r() * (b - a + 1)),
+    chance: p => r() < p,
+    pick: arr => arr[Math.floor(r() * arr.length)],
+  };
+}
+// independent stream per subsystem so resizing width doesn't reshuffle everything
+const subSeed = (seed, n) => (Math.imul(seed ^ 0x9E3779B9, 0x85EBCA6B) + n * 0xC2B2AE35) >>> 0;
+
+/* ------------------------------------------------------------------
+ * Colour helpers
+ * ------------------------------------------------------------------ */
+const hexToRgb = h => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+const rgbToHex = ([r, g, b]) => '#' + [r, g, b].map(v => Math.round(v).toString(16).padStart(2, '0')).join('');
+const mix = (a, b, t) => { const A = hexToRgb(a), B = hexToRgb(b); return rgbToHex(A.map((v, i) => v + (B[i] - v) * t)); };
+const rgba = (hex, a) => { const [r, g, b] = hexToRgb(hex); return `rgba(${r},${g},${b},${a})`; };
+
+/* ------------------------------------------------------------------
+ * Palette
+ * ------------------------------------------------------------------ */
+const BAYER4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+
+// Colours all come from each config section's `colors` block; this just maps
+// them to the short names the drawing code uses.
+const SKY = CFG.sky.colors, MOON = CFG.moon.colors, CLOUD = CFG.clouds.colors;
+const NEON = CFG.neonSigns.colors, ROOF = CFG.rooftopLights.colors, STREET = CFG.street.colors;
+const LAMP = CFG.streetlights.colors.sidewalk, FGLAMP = CFG.streetlights.colors.foreground;
+const PAL = {
+  sky: SKY.gradient, haze: SKY.haze, moonHalo: SKY.moonHalo,
+  stars: CFG.stars.colors,
+  moon: MOON.surface, moonShade: MOON.shade, moonCrater: MOON.crater, moonGlow: MOON.glow,
+  neon: NEON.tubes, signBody: NEON.body,
+  beaconOn: ROOF.on, beaconOff: ROOF.off,
+  sidewalk: STREET.sidewalk, curb: STREET.curb, road: STREET.road, lane: STREET.laneMarkings,
+  pole: LAMP.pole, lamp: LAMP.light, lampGlow: LAMP.glow,
+  cloud: CLOUD.body, cloudLit: CLOUD.lit, cloudShade: CLOUD.shade,
+  fgPole: FGLAMP.pole, fgRim: FGLAMP.hoodTop, fgLens: FGLAMP.light, fgGlow: FGLAMP.glow,
+};
+
+const WIN_PALETTES = Object.values(CFG.windows.colors).map(p => ({ w: p.weight, c: p.shades }));
+
+const B = CFG.buildings.colors;
+const LAYERS = [
+  { // far
+    body: B.far.body, rim: B.far.edge, unlit: B.far.darkWindows,
+    hMin: .26, hMax: .55, tower: .06, wMin: 6, wMax: 15, gap: [-2, 1],
+    litP: [.06, .22], winFade: .6,
+    tiers: .3, props: .35, neon: 0, haze: .38,
+  },
+  { // mid
+    body: B.mid.body, rim: B.mid.edge, unlit: B.mid.darkWindows,
+    hMin: .16, hMax: .52, tower: .1, wMin: 8, wMax: 19, gap: [-1, 2],
+    litP: [.1, .42], winFade: .25,
+    tiers: .35, props: .5, neon: .06, haze: .2,
+  },
+  { // near
+    body: B.near.body, rim: B.near.edge, unlit: B.near.darkWindows,
+    hMin: .09, hMax: .36, tower: .08, wMin: 10, wMax: 24, gap: [0, 3],
+    litP: [.15, .55], winFade: 0,
+    tiers: .25, props: .55, neon: .3, haze: 0,
+  },
+];
+
+/* ------------------------------------------------------------------
+ * Scene generation (pure data — nothing drawn here)
+ * ------------------------------------------------------------------ */
+function generateScene(seed, W, H) {
+  const s = H / 200;
+  const horizon = Math.round(H * 0.91);
+  const scene = { seed, W, H, s, horizon, stars: [], moon: null, layers: [], lamps: [], meteors: [], cars: [], peds: [], ufo: null };
+
+  // Moon
+  {
+    const rng = makeRng(subSeed(seed, 1));
+    const r = Math.max(5, Math.round(H * 0.045));
+    const moon = {
+      x: Math.round(rng.range(.12, .88) * W),
+      y: Math.round(rng.range(.1, .26) * H),
+      r, craters: [],
+    };
+    for (let i = rng.int(3, 6); i > 0; i--) {
+      const a = rng.range(0, Math.PI * 2), d = rng.range(0, r * .65);
+      moon.craters.push({ x: Math.round(Math.cos(a) * d), y: Math.round(Math.sin(a) * d), r: Math.max(1, Math.round(rng.range(.08, .25) * r)) });
+    }
+    moon.dir = rng.chance(.5) ? 1 : -1;     // drift direction
+    moon.R = Math.ceil(r * 5.2) + 2;        // sprite half-size (covers glow + halo)
+    moon.cx = moon.x;                       // current (drifting) centre
+    scene.moon = moon;
+  }
+
+  // Stars (denser near the top)
+  {
+    const rng = makeRng(subSeed(seed, 2));
+    const count = Math.round((W * H) / 150);
+    for (let i = 0; i < count; i++) {
+      const x = rng.int(0, W - 1);
+      const y = Math.floor(Math.pow(rng.next(), 1.7) * horizon * .8);
+      const roll = rng.next();
+      const b = roll < .6 ? 0 : roll < .87 ? 1 : roll < .97 ? 2 : 3;
+      scene.stars.push({
+        x, y, b,
+        big: b === 3 && rng.chance(.5),
+        tw: rng.chance(.5), ph: rng.next(), sp: rng.range(.12, .4), // rad/s → 15–50s cycles
+      });
+    }
+  }
+
+  // Building layers
+  LAYERS.forEach((def, li) => {
+    const rng = makeRng(subSeed(seed, 10 + li));
+    const keep = makeRng(subSeed(seed, 40 + li));
+    const buildings = [];
+    let x = -rng.int(0, Math.round(def.wMax * s));
+    while (x < W) {
+      const b = genBuilding(rng, def, li, x, scene);
+      // count < 1 leaves some plots empty. Decided on a separate stream so the
+      // remaining buildings are exactly the ones you'd get at count 1.
+      if (keep.next() < BUILDING_COUNT[li]) buildings.push(b);
+      x += b.w + rng.int(def.gap[0], def.gap[1]);
+    }
+    scene.layers.push({ def, buildings });
+  });
+
+  // Street lamps
+  {
+    const rng = makeRng(subSeed(seed, 20));
+    let x = rng.int(4, 14);
+    while (x < W + 4) {
+      scene.lamps.push({
+        x, top: horizon - Math.round(rng.int(10, 13) * s),
+        dir: rng.chance(.5) ? 1 : -1,
+      });
+      x += Math.round(rng.int(...CFG.streetlights.sidewalkSpacing) * s);
+    }
+  }
+
+  // Clouds
+  {
+    const rng = makeRng(subSeed(seed, 30));
+    scene.cloudiness = rng.chance(CLEAR_NIGHT_CHANCE) ? 0 : rng.range(...CFG.clouds.cloudiness);
+    scene.wind = rng.chance(.5) ? 1 : -1;
+    scene.maxClouds = Math.max(2, Math.round((W / (CFG.clouds.spacing * s)) * scene.cloudiness));
+    scene.clouds = [];
+    const n = Math.round(scene.maxClouds * rng.range(.7, 1) * (scene.cloudiness > 0));
+    // stratified so starting clouds spread across the sky instead of bunching
+    for (let i = 0; i < n; i++) scene.clouds.push(makeCloud(rng, scene, ((i + rng.next()) / n) * W * 1.1 - W * .15));
+  }
+
+  // Foreground lamp posts (close to the viewer, sparse)
+  {
+    const rng = makeRng(subSeed(seed, 21));
+    scene.fgLamps = [];
+    let x = Math.round(rng.int(6, 30) * s);
+    const dir = rng.chance(.5) ? 1 : -1; // a real street's lamps all face the same way
+    while (x < W + 10) {
+      scene.fgLamps.push({
+        x, top: Math.round(rng.range(.83, .84) * H),
+        dir, arm: 2,
+      });
+      x += Math.round(rng.int(...CFG.streetlights.foregroundSpacing) * s);
+    }
+  }
+
+  return scene;
+}
+
+function genBuilding(rng, def, li, x, scene) {
+  const { H, s, horizon } = scene;
+  const w = rng.int(Math.round(def.wMin * s), Math.round(def.wMax * s));
+  let hf = rng.range(def.hMin, def.hMax);
+  if (rng.chance(def.tower)) hf = Math.min(.8, hf * 1.55);
+  const h = Math.max(6, Math.round(hf * H));
+  const color = rng.pick(def.body);
+  const b = { x, w, h, color, rects: [], props: [], beacons: [], windows: [], signs: [] };
+
+  // Body, optionally with setbacks
+  const tiers = h > H * .28 && rng.chance(def.tiers) ? rng.int(1, 2) : 0;
+  let cx = x, cw = w, cy = horizon, remaining = h;
+  for (let t = 0; t <= tiers && remaining > 0 && cw >= 3; t++) {
+    const th = t === tiers ? remaining : Math.max(2, Math.round(remaining * rng.range(.55, .75)));
+    b.rects.push({ x: cx, y: cy - th, w: cw, h: th });
+    cy -= th; remaining -= th;
+    const inset = rng.int(1, Math.max(1, Math.floor(cw / 5)));
+    cx += inset; cw -= inset * 2;
+  }
+  const top = b.rects[b.rects.length - 1];
+
+  // Rooftop details
+  if (rng.chance(def.props)) genRoof(rng, b, top, s);
+
+  // Windows
+  genWindows(rng, def, b, horizon);
+
+  // Neon signage
+  if (rng.chance(def.neon) && h > 22) genSign(rng, b, top, horizon);
+
+  return b;
+}
+
+function genRoof(rng, b, top, s) {
+  const P = (x, y, w, h) => b.props.push({ x, y, w, h });
+  // sp = cycles per second → one slow breath every few seconds (see config)
+  const beacon = (x, y) => b.beacons.push({ x, y, ph: rng.next(), sp: 1 / rng.range(...CFG.rooftopLights.fadeSeconds) });
+  const kind = rng.pick(['antenna', 'antenna', 'water', 'spire', 'hvac', 'hvac', 'slope']);
+
+  switch (kind) {
+    case 'antenna': {
+      const n = top.w > 8 && rng.chance(.3) ? 2 : 1;
+      for (let i = 0; i < n; i++) {
+        const ax = top.x + rng.int(1, Math.max(1, top.w - 2));
+        const ah = rng.int(3, Math.round(13 * s));
+        P(ax, top.y - ah, 1, ah);
+        if (ah > 5 && rng.chance(.5)) P(ax - 1, top.y - ah + rng.int(2, ah - 2), 3, 1);
+        beacon(ax, top.y - ah - 1);
+      }
+      break;
+    }
+    case 'water': {
+      if (top.w < 5) break;
+      const tw = rng.int(3, Math.min(5, top.w - 1));
+      const tx = top.x + rng.int(1, Math.max(1, top.w - tw - 1));
+      const th = rng.int(3, 4);
+      P(tx, top.y - 2, 1, 2); P(tx + tw - 1, top.y - 2, 1, 2);
+      P(tx, top.y - 2 - th, tw, th);
+      P(tx + 1, top.y - 3 - th, tw - 2, 1);
+      break;
+    }
+    case 'spire': {
+      if (top.w < 5) break;
+      const steps = rng.int(2, 4);
+      const step = Math.max(1, Math.round(top.w / (2 * steps + 2)));
+      let sw = top.w, sy = top.y;
+      for (let i = 0; i < steps; i++) {
+        sw -= step * 2; if (sw < 1) break;
+        const sh = rng.int(1, 3);
+        sy -= sh;
+        P(top.x + Math.floor((top.w - sw) / 2), sy, sw, sh);
+      }
+      const nh = rng.int(3, Math.round(9 * s));
+      const nx = top.x + Math.floor(top.w / 2);
+      P(nx, sy - nh, 1, nh);
+      beacon(nx, sy - nh - 1);
+      break;
+    }
+    case 'hvac': {
+      for (let i = rng.int(1, 3); i > 0; i--) {
+        const bw = rng.int(2, 4), bh = rng.int(1, 2);
+        if (top.w < bw + 2) continue;
+        P(top.x + rng.int(1, top.w - bw - 1), top.y - bh, bw, bh);
+      }
+      break;
+    }
+    case 'slope': {
+      const right = rng.chance(.5);
+      for (let i = 1; ; i++) {
+        const sw = top.w - i * 2;
+        if (sw < 1) break;
+        P(right ? top.x : top.x + top.w - sw, top.y - i, sw, 1);
+      }
+      break;
+    }
+  }
+}
+
+function pickWindowPalette(rng) {
+  const total = WIN_PALETTES.reduce((a, p) => a + p.w, 0);
+  let r = rng.next() * total;
+  for (const p of WIN_PALETTES) { if ((r -= p.w) < 0) return p.c; }
+  return WIN_PALETTES[0].c;
+}
+
+function genWindows(rng, def, b, horizon) {
+  const style = rng.chance(.12) ? 'bands' : rng.chance(.12) ? 'columns' : 'grid';
+  const ww = rng.int(1, 2), wh = rng.int(1, 2), gx = rng.int(1, 2), gy = rng.int(1, 2);
+  const litP = rng.range(def.litP[0], def.litP[1]);
+  const pal = pickWindowPalette(rng).map(c => mix(c, PAL.haze, def.winFade));
+  b.litP = litP;
+  const push = (x, y, w, h, on) => b.windows.push({
+    x, y, w, h, on, c: rng.pick(pal), ph: rng.next(), k: null,
+  });
+  const floorY = horizon - 2;
+
+  for (const r of b.rects) {
+    const mx = rng.int(1, 2);
+    const x0 = r.x + mx, x1 = r.x + r.w - mx; // [x0, x1)
+    const yEnd = Math.min(r.y + r.h - 1, floorY);
+    if (x1 - x0 < 1) continue;
+
+    if (style === 'grid') {
+      const cols = Math.floor((x1 - x0 + gx) / (ww + gx));
+      if (cols < 1) continue;
+      const used = cols * (ww + gx) - gx;
+      const ox = r.x + Math.floor((r.w - used) / 2);
+      for (let y = r.y + 2; y + wh <= yEnd; y += wh + gy) {
+        const mode = rng.next(); // whole floors lit / dark sometimes
+        for (let c = 0; c < cols; c++) {
+          const on = mode < .07 ? true : mode < .22 ? false : rng.chance(litP);
+          push(ox + c * (ww + gx), y, ww, wh, on);
+        }
+      }
+    } else if (style === 'bands') {
+      for (let y = r.y + 2; y + 1 <= yEnd; y += 1 + gy) {
+        for (let x = x0; x < x1;) {
+          const len = Math.min(rng.int(2, 6), x1 - x);
+          push(x, y, len, 1, rng.chance(litP));
+          x += len;
+        }
+      }
+    } else { // columns
+      for (let x = x0; x < x1; x += 2) {
+        for (let y = r.y + 2; y < yEnd;) {
+          const len = Math.min(rng.int(2, 5), yEnd - y);
+          push(x, y, 1, len, rng.chance(litP));
+          y += len + 1;
+        }
+      }
+    }
+  }
+}
+
+function genSign(rng, b, top, horizon) {
+  const color = rng.pick(PAL.neon);
+  const base = b.rects[0];
+  const bits = n => Array.from({ length: n }, () => rng.chance(.62));
+  if (rng.chance(.55) || b.props.length) { // vertical blade sign
+    const sw = 3, sh = rng.int(8, Math.min(18, Math.max(8, Math.floor(base.h * .5))));
+    const left = rng.chance(.5);
+    const sx = left ? b.x - sw + 1 : b.x + b.w - 1;
+    const maxY = horizon - 4 - sh;
+    const sy = Math.min(maxY, base.y + rng.int(3, Math.max(3, base.h - sh - 6)));
+    if (sy < base.y) return;
+    b.signs.push({ x: sx, y: sy, w: sw, h: sh, color, bits: bits(sh - 2), on: true, ph: Math.random(), k: null });
+  } else if (top.w >= 7) { // rooftop billboard
+    const bw = top.w - 2, bh = 4, bx = top.x + 1, by = top.y - bh - 1;
+    b.props.push({ x: bx + 1, y: top.y - 1, w: 1, h: 1 }, { x: bx + bw - 2, y: top.y - 1, w: 1, h: 1 });
+    b.signs.push({ x: bx, y: by, w: bw, h: bh, color, bits: bits((bw - 2) * (bh - 2)), on: true, ph: Math.random(), k: null });
+  }
+}
+
+/* ------------------------------------------------------------------
+ * Drawing primitives
+ * ------------------------------------------------------------------ */
+function fillCircle(ctx, cx, cy, r) {
+  for (let dy = -r; dy <= r; dy++) {
+    const half = Math.floor(Math.sqrt(r * r - dy * dy) + .35);
+    ctx.fillRect(cx - half, cy + dy, half * 2 + 1, 1);
+  }
+}
+function glow(ctx, cx, cy, r, hex, strength = 1) {
+  // stacked pixel-circles = stepped, pixel-art glow
+  const rings = [[1, .045], [.66, .06], [.36, .11]];
+  for (const [f, a] of rings) {
+    ctx.fillStyle = rgba(hex, a * strength);
+    fillCircle(ctx, cx, cy, Math.max(1, Math.round(r * f)));
+  }
+}
+function makeCanvas(W, H) {
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  return c;
+}
+
+/* ------------------------------------------------------------------
+ * Static caches (things that never change frame to frame)
+ * ------------------------------------------------------------------ */
+function buildCaches(scene) {
+  const litLeft = scene.moon.cx < scene.W / 2;
+  return {
+    sky: buildSky(scene),
+    moon: buildMoonSprites(scene),
+    foreground: buildForeground(scene),
+    litLeft, prevLayers: null, fadeT0: 0,
+    layers: scene.layers.map(l => buildLayer(scene, l, litLeft)),
+    haze: scene.layers.map(l => (l.def.haze ? buildHaze(scene, l.def.haze) : null)),
+    street: buildStreet(scene),
+  };
+}
+
+function buildSky(scene) {
+  const { W, H, horizon } = scene;
+  const c = makeCanvas(W, H), ctx = c.getContext('2d');
+  const img = ctx.createImageData(W, H), d = img.data;
+  const pal = PAL.sky.map(hexToRgb), n = pal.length - 1;
+
+  for (let y = 0; y < H; y++) {
+    const t = Math.min(1, Math.pow(y / horizon, 1.25));
+    const f = t * n, i = Math.min(n - 1, Math.floor(f)), fr = f - i;
+    for (let x = 0; x < W; x++) {
+      const th = (BAYER4[(y & 3) * 4 + (x & 3)] + .5) / 16;
+      const col = fr > th ? pal[i + 1] : pal[i];
+      const k = (y * W + x) * 4;
+      d[k] = col[0]; d[k + 1] = col[1]; d[k + 2] = col[2]; d[k + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return c;
+}
+
+// The moon is three small sprites centred at (R, R) so it can drift:
+//   halo — dithered ring of moonlight in the sky
+//   glow — stepped soft rings (drawn with a slowly pulsing alpha)
+//   disc — the moon itself
+function buildMoonSprites(scene) {
+  const { r, R, craters } = scene.moon;
+  const size = R * 2 + 1;
+
+  const halo = makeCanvas(size, size), hc = halo.getContext('2d');
+  const haloR = r * 4.5;
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    const dx = x - R, dy = y - R;
+    const g = 1 - Math.sqrt(dx * dx + dy * dy) / haloR;
+    if (g <= 0) continue;
+    const th = (BAYER4[(y & 3) * 4 + (x & 3)] + .5) / 16;
+    const lvl = Math.floor(g * 3 + th);
+    if (lvl > 0) { hc.fillStyle = rgba(PAL.moonHalo, lvl * .075); hc.fillRect(x, y, 1, 1); }
+  }
+
+  const glow = makeCanvas(size, size), gc = glow.getContext('2d');
+  for (const [f, a] of [[5.2, .025], [3.8, .035], [2.7, .05], [1.9, .07], [1.4, .1]]) {
+    gc.fillStyle = rgba(PAL.moonGlow, a);
+    fillCircle(gc, R, R, Math.round(r * f));
+  }
+
+  const disc = makeCanvas(size, size), dc = disc.getContext('2d');
+  dc.fillStyle = PAL.moon; fillCircle(dc, R, R, r);
+  dc.fillStyle = PAL.moonShade; // terminator shading on the lower-right limb
+  for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+    if (dx * dx + dy * dy > r * r + r * .7) continue;
+    const ox = dx + r * .35, oy = dy + r * .25;
+    if (ox * ox + oy * oy > r * r * 1.02) dc.fillRect(R + dx, R + dy, 1, 1);
+  }
+  dc.fillStyle = PAL.moonCrater;
+  for (const cr of craters) fillCircle(dc, R + cr.x, R + cr.y, cr.r);
+
+  return { halo, glow, disc };
+}
+
+function buildLayer(scene, layer, litFromLeft) {
+  const { W, H } = scene;
+  const c = makeCanvas(W, H), ctx = c.getContext('2d');
+  for (const b of layer.buildings) {
+    ctx.fillStyle = b.color;
+    for (const r of b.rects) ctx.fillRect(r.x, r.y, r.w, r.h);
+    for (const p of b.props) ctx.fillRect(p.x, p.y, p.w, p.h);
+    // moonlit rim
+    ctx.fillStyle = layer.def.rim;
+    for (const r of b.rects) {
+      ctx.fillRect(litFromLeft ? r.x : r.x + r.w - 1, r.y, 1, r.h);
+      ctx.fillRect(r.x, r.y, r.w, 1);
+    }
+  }
+  return c;
+}
+
+function buildHaze(scene, maxA) {
+  const { W, H, horizon } = scene;
+  const c = makeCanvas(W, H), ctx = c.getContext('2d');
+  const y0 = horizon - Math.round(H * .5);
+  for (let y = y0; y < horizon; y++) {
+    const f = (y - y0) / (horizon - y0);
+    const a = (Math.round(f * f * 6) / 6) * maxA;
+    if (a <= 0) continue;
+    ctx.fillStyle = rgba(PAL.haze, a);
+    ctx.fillRect(0, y, W, 1);
+  }
+  return c;
+}
+
+function buildStreet(scene) {
+  const { W, H, horizon, lamps } = scene;
+  const c = makeCanvas(W, H), ctx = c.getContext('2d');
+  ctx.fillStyle = PAL.sidewalk; ctx.fillRect(0, horizon, W, 3);
+  ctx.fillStyle = PAL.curb; ctx.fillRect(0, horizon + 3, W, 1);
+  ctx.fillStyle = PAL.road; ctx.fillRect(0, horizon + 4, W, H - horizon - 4);
+  const laneY = horizon + 4 + Math.floor((H - horizon - 4) / 2);
+  ctx.fillStyle = PAL.lane;
+  for (let x = 0; x < W; x += 8) ctx.fillRect(x, laneY, 4, 1);
+  // lamp posts
+  for (const l of lamps) {
+    ctx.fillStyle = PAL.pole;
+    ctx.fillRect(l.x, l.top, 1, horizon + 2 - l.top);
+    ctx.fillRect(l.x - 1, horizon + 1, 3, 1);          // base
+    ctx.fillRect(Math.min(l.x, l.x + l.dir * 3), l.top, 4, 1); // arm
+  }
+  return c;
+}
+
+/* ------------------------------------------------------------------
+ * Per-frame (dynamic) drawing — all take time t in ms
+ * ------------------------------------------------------------------ */
+function drawStars(ctx, scene, t) {
+  for (const st of scene.stars) {
+    // continuous brightness, slowly drifting; two detuned sines keep it irregular
+    let br = st.b;
+    if (st.tw) {
+      const v = (Math.sin(t * .001 * st.sp + st.ph * 6.283) + .5 * Math.sin(t * .00137 * st.sp + st.ph * 17)) / 1.5;
+      br = Math.min(3, Math.max(-1, br + v * .9));
+    }
+    if (br < 0) { // fading toward nothing
+      ctx.fillStyle = rgba(PAL.stars[0], 1 + br);
+      ctx.fillRect(st.x, st.y, 1, 1);
+      continue;
+    }
+    const lo = Math.floor(br), fr = br - lo;
+    ctx.fillStyle = PAL.stars[lo];
+    ctx.fillRect(st.x, st.y, 1, 1);
+    if (fr > .02 && lo < 3) { // blend toward the next level up
+      ctx.fillStyle = rgba(PAL.stars[lo + 1], fr);
+      ctx.fillRect(st.x, st.y, 1, 1);
+    }
+    if (st.big && br >= 2) {
+      ctx.globalAlpha = Math.min(1, br - 2);
+      ctx.fillStyle = PAL.stars[1];
+      ctx.fillRect(st.x - 1, st.y, 1, 1); ctx.fillRect(st.x + 1, st.y, 1, 1);
+      ctx.fillRect(st.x, st.y - 1, 1, 1); ctx.fillRect(st.x, st.y + 1, 1, 1);
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+
+// Each window has its own offset within WINDOW_PERIOD; when its personal tick
+// rolls over it may switch. Off→on odds are scaled by the building's lit ratio
+// so overall density stays roughly constant.
+// Every light on a building — each window and each neon sign — gets its own
+// turn once per WINDOW_PERIOD and may switch (with a fade) on that turn.
+// Window odds are split so a building keeps its overall brightness:
+// lit windows go dark with 2p·(1−L), dark ones light up with 2p·L
+// (L = that building's share of lit windows).
+const SIGN_OFF_P = .04, SIGN_ON_P = .45;  // signs: mostly on, occasionally off a while
+function lightTurn(light, t) {
+  const k = Math.floor(t / WINDOW_PERIOD + light.ph);
+  if (light.k === null || light.k === undefined) { light.k = k; return false; }
+  if (k === light.k) return false;
+  light.k = k;
+  return true;
+}
+function updateWindows(scene, t) {
+  for (const layer of scene.layers) for (const b of layer.buildings) {
+    const L = Math.min(.9, Math.max(.1, b.litP));
+    const pOff = 2 * WINDOW_SWITCH_P * (1 - L);
+    const pOn = 2 * WINDOW_SWITCH_P * L;
+    for (const w of b.windows) {
+      if (lightTurn(w, t) && Math.random() < (w.on ? pOff : pOn)) { w.on = !w.on; w.ts = t; }
+    }
+    for (const sg of b.signs) {
+      if (lightTurn(sg, t) && Math.random() < (sg.on ? SIGN_OFF_P : SIGN_ON_P)) { sg.on = !sg.on; sg.ts = t; }
+    }
+  }
+}
+
+// 0..1 brightness of a light that fades over WINDOW_FADE when it switches
+function lightLevel(light, t) {
+  const target = light.on ? 1 : 0;
+  if (light.ts === undefined) return target;
+  const p = (t - light.ts) / WINDOW_FADE;
+  if (p >= 1 || p < 0) return target;
+  const e = p * p * (3 - 2 * p);
+  return light.on ? e : 1 - e;
+}
+
+function drawWindows(ctx, layer, t) {
+  const unlit = layer.def.unlit;
+  let last = null;
+  for (const b of layer.buildings) for (const w of b.windows) {
+    if (w.ts !== undefined) { // mid-fade: unlit base, lit colour at eased alpha
+      const p = (t - w.ts) / WINDOW_FADE;
+      if (p < 1 && p >= 0) {
+        const e = p * p * (3 - 2 * p);
+        if (unlit) { ctx.fillStyle = unlit; ctx.fillRect(w.x, w.y, w.w, w.h); }
+        ctx.fillStyle = rgba(w.c, w.on ? e : 1 - e);
+        ctx.fillRect(w.x, w.y, w.w, w.h);
+        last = null;
+        continue;
+      }
+      w.ts = undefined;
+    }
+    const col = w.on ? w.c : unlit;
+    if (!col) continue;
+    if (col !== last) { ctx.fillStyle = col; last = col; }
+    ctx.fillRect(w.x, w.y, w.w, w.h);
+  }
+}
+
+function drawBeacons(ctx, layer, t) {
+  // slow, smooth breathing: dark ember → soft dim red and back
+  for (const b of layer.buildings) for (const bc of b.beacons) {
+    const v = .5 - .5 * Math.cos((t * .001 * bc.sp + bc.ph) * Math.PI * 2); // 0..1
+    const e = v * v * (3 - 2 * v);                                         // ease
+    ctx.fillStyle = PAL.beaconOff;
+    ctx.fillRect(bc.x, bc.y, 1, 1);
+    ctx.fillStyle = rgba(PAL.beaconOn, .55 * e);
+    ctx.fillRect(bc.x, bc.y, 1, 1);
+    ctx.fillStyle = rgba(PAL.beaconOn, .07 * e);
+    ctx.fillRect(bc.x - 1, bc.y - 1, 3, 3);
+  }
+}
+
+function drawSigns(ctx, layer, t) {
+  for (const b of layer.buildings) for (const sg of b.signs) {
+    const { x, y, w, h, color } = sg;
+    const lv = lightLevel(sg, t);
+    if (lv > 0) {
+      ctx.fillStyle = rgba(color, .08 * lv); ctx.fillRect(x - 3, y - 3, w + 6, h + 6);
+      ctx.fillStyle = rgba(color, .14 * lv); ctx.fillRect(x - 1, y - 1, w + 2, h + 2);
+    }
+    ctx.fillStyle = PAL.signBody; ctx.fillRect(x, y, w, h);
+    // unlit tubes stay faintly visible; lit colour fades over them
+    const tubes = g => {
+      g.fillRect(x, y, w, 1); g.fillRect(x, y + h - 1, w, 1);
+      g.fillRect(x, y, 1, h); g.fillRect(x + w - 1, y, 1, h);
+      const iw = w - 2;
+      sg.bits.forEach((on, i) => { if (on) g.fillRect(x + 1 + (i % iw), y + 1 + Math.floor(i / iw), 1, 1); });
+    };
+    ctx.fillStyle = mix(color, PAL.signBody, .75); tubes(ctx);
+    if (lv > 0) { ctx.fillStyle = rgba(color, lv); tubes(ctx); }
+  }
+}
+
+function drawLamps(ctx, scene, t) {
+  const r = Math.round(7 * scene.s);
+  for (const l of scene.lamps) {
+    const hx = l.x + l.dir * 3, hy = l.top + 1;
+    glow(ctx, hx, hy + 2, r, PAL.lampGlow);
+    ctx.fillStyle = PAL.lamp;
+    ctx.fillRect(Math.min(hx, hx + l.dir), hy, 2, 1);
+  }
+}
+
+// The moon drifts sideways very slowly; once it (and its glow) has fully left
+// one edge it comes back in from the opposite edge.
+function updateMoon(scene, t) {
+  const m = scene.moon;
+  if (m.t0 === undefined) m.t0 = t;
+  const span = scene.W + m.R * 2;
+  const travel = m.dir * MOON_DRIFT * (t - m.t0) / 60000;
+  const p = (((m.x + m.R + travel) % span) + span) % span;
+  m.cx = p - m.R;
+}
+
+// Drawn on the full-resolution canvas so the drift is smooth, not 1-art-px jumps.
+function drawMoon(ctx, scene, t, px, sprites) {
+  const m = scene.moon, size = m.R * 2 + 1;
+  const sx = Math.round((m.cx - m.R) * px), sy = (m.y - m.R) * px, sz = size * px;
+  const v = .5 - .5 * Math.cos((t / MOON_PULSE) * Math.PI * 2);
+  const k = .6 + .4 * v * v * (3 - 2 * v); // glow breathes 0.6 → 1.0
+  ctx.drawImage(sprites.halo, sx, sy, sz, sz);
+  ctx.globalAlpha = k;
+  ctx.drawImage(sprites.glow, sx, sy, sz, sz);
+  ctx.globalAlpha = 1;
+  ctx.drawImage(sprites.disc, sx, sy, sz, sz);
+}
+
+function fillEllipse(ctx, cx, cy, rx, ry) {
+  for (let dy = -ry; dy <= ry; dy++) {
+    const half = Math.floor(rx * Math.sqrt(1 - (dy * dy) / (ry * ry)) + .35);
+    ctx.fillRect(cx - half, cy + dy, half * 2 + 1, 1);
+  }
+}
+
+// Foreground lamp posts: near-black silhouettes rising from the bottom edge
+function buildForeground(scene) {
+  const { W, H, fgLamps } = scene;
+  const c = makeCanvas(W, H), ctx = c.getContext('2d');
+  for (const l of fgLamps) {
+    const { x, top, dir, arm } = l;
+    const endX = x + dir * arm;
+    ctx.fillStyle = PAL.fgPole;
+    ctx.fillRect(x, top, 1, H - top);                     // pole
+    ctx.fillRect(x - 1, H - 2, 3, 2);                     // base
+    ctx.fillRect(Math.min(x, endX), top, arm + 1, 1);     // arm
+    ctx.fillRect(endX - 1, top, 3, 1);                    // hood
+    ctx.fillStyle = PAL.fgRim;
+    ctx.fillRect(endX - 1, top - 1, 3, 1);                // moonlit hood top
+  }
+  return c;
+}
+
+function drawForegroundLamps(ctx, scene) {
+  const { H, s } = scene;
+  for (const l of scene.fgLamps) {
+    const lx = l.x + l.dir * l.arm, ly = l.top + 1;
+    glow(ctx, lx, ly + 2, Math.round(5 * s), PAL.fgGlow, .55);
+    // faint pool of light on the road below
+    ctx.fillStyle = rgba(PAL.fgGlow, .03); fillEllipse(ctx, lx, H - 2, Math.round(6 * s), Math.max(1, Math.round(1.5 * s)));
+    ctx.fillStyle = PAL.fgLens;
+    ctx.fillRect(lx - 1, ly, 3, 1);
+  }
+}
+
+/* ------------------------------------------------------------------
+ * Clouds
+ * ------------------------------------------------------------------ */
+// Soft cumulus puff: a density field from overlapping round puffs (each
+// fading from 1 at its centre to 0 at its edge). Dense pixels are solid,
+// thin ones are dithered and semi-transparent, so the outline is ragged and
+// fluffy rather than a hard shape. Shading is gentle: a soft moonlit crown
+// and a slightly darker, dithered belly.
+function makeCloud(rng, scene, x) {
+  const { horizon, s } = scene;
+  const w = Math.round(rng.int(12, 28) * s);
+  const h = Math.max(5, Math.min(Math.round(9 * s), Math.round(w * rng.range(.34, .46))));
+  const pad = 1;
+  const cw = w + pad * 2, ch = h + pad;
+
+  const blobs = [];
+  // a broad, soft lower body
+  blobs.push({ cx: cw / 2, cy: ch - h * .32, r: h * .42, sx: (w * .5) / (h * .42) });
+  // round puffs piled on top, bigger toward the middle
+  const n = rng.int(3, 5);
+  for (let i = 0; i < n; i++) {
+    const cx = pad + w * (.15 + .7 * (i + rng.range(.25, .75)) / n);
+    const centre = 1 - Math.abs(cx - cw / 2) / (w / 2);
+    const r = h * (.3 + .28 * centre) * rng.range(.85, 1.15);
+    const stagger = i % 2 ? -h * .1 : h * .06; // alternate high/low → distinct bumps
+    blobs.push({ cx, cy: ch - h * .4 - centre * h * .22 - stagger, r, sx: rng.range(1, 1.2) });
+  }
+  // a couple of small stray wisps at the ends
+  for (let i = rng.int(0, 2); i > 0; i--) {
+    const left = rng.chance(.5);
+    const r = h * rng.range(.15, .25);
+    blobs.push({ cx: left ? pad + r * 1.2 : cw - pad - r * 1.2, cy: ch - h * .25, r, sx: 1.8 });
+  }
+  const density = (x, y) => {
+    let d = 0;
+    for (const b of blobs) {
+      const dx = (x + .5 - b.cx) / b.sx, dy = y + .5 - b.cy;
+      d = Math.max(d, 1 - Math.sqrt(dx * dx + dy * dy) / b.r);
+    }
+    return d;
+  };
+
+  const c = makeCanvas(cw, ch), ctx = c.getContext('2d');
+  const EDGE = .22;
+  for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+    const d = density(x, y);
+    if (d <= 0) continue;
+    const th = (BAYER4[(y & 3) * 4 + (x & 3)] + .5) / 16;
+    if (d < EDGE) {                                   // fluffy fringe
+      if (d / EDGE < th) continue;
+      ctx.fillStyle = rgba(PAL.cloud, .55);
+      ctx.fillRect(x, y, 1, 1);
+      continue;
+    }
+    const g = y / ch;                                 // 0 top → 1 bottom
+    let col = PAL.cloud;
+    if (density(x, y - 1) < EDGE && g < .6) col = PAL.cloudLit;      // moonlit crown
+    else if (g > .62 + (th - .5) * .3) col = PAL.cloudShade;        // soft belly
+    ctx.fillStyle = col;
+    ctx.fillRect(x, y, 1, 1);
+  }
+  return {
+    img: c, w: cw, x0: x, t0: null,
+    y: Math.round(rng.range(.04, .42) * horizon),
+    speed: rng.range(CLOUD_SPEED[0], CLOUD_SPEED[1]) * s,
+    alpha: rng.range(.7, .9),
+  };
+}
+
+function updateClouds(scene, t) {
+  const { W, wind } = scene;
+  for (const c of scene.clouds) {
+    if (c.t0 === null) c.t0 = t;
+    c.x = c.x0 + wind * c.speed * (t - c.t0) / 1000;
+  }
+  scene.clouds = scene.clouds.filter(c => (wind > 0 ? c.x < W + 2 : c.x > -c.w - 2));
+
+  if (!scene.cloudiness) return;
+  if (scene.cloudNext === undefined) scene.cloudNext = t + Math.random() * CLOUD_SPAWN_EVERY;
+  if (t >= scene.cloudNext) {
+    scene.cloudNext = t + CLOUD_SPAWN_EVERY * (.5 + Math.random());
+    if (scene.clouds.length < scene.maxClouds && Math.random() < scene.cloudiness) {
+      const rng = makeRng((Math.random() * 2 ** 32) >>> 0);
+      const c = makeCloud(rng, scene, 0);
+      c.x0 = wind > 0 ? -c.w : W;
+      c.t0 = t; c.x = c.x0;
+      scene.clouds.push(c);
+    }
+  }
+}
+
+// Drawn straight onto the full-resolution canvas: px = screen pixels per art pixel.
+// x snaps to whole *screen* pixels, so motion is smooth while edges stay sharp.
+function drawClouds(ctx, scene, px) {
+  for (const c of scene.clouds) {
+    ctx.globalAlpha = c.alpha;
+    ctx.drawImage(c.img, Math.round(c.x * px), c.y * px, c.img.width * px, c.img.height * px);
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ------------------------------------------------------------------
+ * Shooting stars
+ * ------------------------------------------------------------------ */
+const METEOR_COLORS = CFG.shootingStars.colors;
+
+function updateMeteors(scene, t) {
+  const period = Math.floor(t / METEOR_PERIOD);
+  if (scene.meteorPeriod === undefined) {
+    // first frame (or after a resize): only schedule within what's left of this period
+    scene.meteorPeriod = period;
+    const end = (period + 1) * METEOR_PERIOD;
+    scene.meteorAt = Math.random() < METEOR_CHANCE ? t + Math.random() * (end - t) : Infinity;
+  } else if (period !== scene.meteorPeriod) {
+    scene.meteorPeriod = period;
+    scene.meteorAt = Math.random() < METEOR_CHANCE ? (period + Math.random()) * METEOR_PERIOD : Infinity;
+  }
+  if (t >= scene.meteorAt) { spawnMeteor(scene, t); scene.meteorAt = Infinity; }
+  scene.meteors = scene.meteors.filter(m => t - m.t0 < m.dur);
+}
+
+function spawnMeteor(scene, t) {
+  const { W, horizon, s } = scene;
+  const right = Math.random() < .5;                       // direction of travel
+  const ang = (20 + Math.random() * 22) * Math.PI / 180;  // degrees below horizontal
+  const dx = Math.cos(ang) * (right ? 1 : -1), dy = Math.sin(ang);
+  scene.meteors.push({
+    x: W * (right ? Math.random() * .6 : .4 + Math.random() * .6),
+    y: horizon * (.04 + Math.random() * .3),
+    dx, dy,
+    dist: (45 + Math.random() * 45) * s,
+    trail: Math.round((10 + Math.random() * 10) * s),
+    dur: 1300 + Math.random() * 700,
+    t0: t,
+  });
+}
+
+function drawMeteors(ctx, scene, t) {
+  for (const m of scene.meteors) {
+    const p = (t - m.t0) / m.dur;
+    const env = Math.sin(Math.PI * Math.min(1, p * 1.15)); // quick fade in, fade out
+    const hx = m.x + m.dx * m.dist * p, hy = m.y + m.dy * m.dist * p;
+    // step along the major axis so the trail is one pixel per column/row
+    const step = 1 / Math.max(Math.abs(m.dx), Math.abs(m.dy));
+    const n = METEOR_COLORS.length;
+    for (let i = m.trail; i >= 0; i--) {
+      const lvl = Math.floor((1 - (1 - i / m.trail) * env) * n);
+      if (lvl >= n) continue;
+      ctx.fillStyle = METEOR_COLORS[lvl];
+      ctx.fillRect(Math.round(hx - m.dx * step * i), Math.round(hy - m.dy * step * i), 1, 1);
+    }
+    if (env > .5) {
+      ctx.fillStyle = rgba('#ffffff', .25 * env);
+      ctx.fillRect(Math.round(hx) - 1, Math.round(hy) - 1, 3, 3);
+    }
+  }
+}
+
+/* ------------------------------------------------------------------
+ * Cars
+ * ------------------------------------------------------------------ */
+// Sprites face right. L = moonlit body top, B = body, D = lower body,
+// G = glass, H = headlight, T = tail light, W = tyre, C = hubcap, Y = taxi sign
+const CAR_SHAPES = {
+  sedan: [
+    '...LLLLL....',
+    '..LGGBGGL...',
+    'LLBBBBBBBLLL',
+    'TBBBBBBBBBBH',
+    'DWCWDDDWCWDD',
+    '.WWW...WWW..',
+  ],
+  hatch: [
+    '..LLLL....',
+    '.LGGBGL...',
+    'LBBBBBBLLL',
+    'TBBBBBBBBH',
+    'DWCWDDWCWD',
+    '.WWW..WWW.',
+  ],
+  van: [
+    '.LLLLLLLLL...',
+    '.BGGBGGBGGL..',
+    '.BBBBBBBBBBL.',
+    'TBBBBBBBBBBBH',
+    'DWCWDDDDWCWDD',
+    '.WWW....WWW..',
+  ],
+  taxi: [
+    '.....YY.....',
+    '...LLLLL....',
+    '..LGGBGGL...',
+    'LLBBBBBBBLLL',
+    'TBBBBBBBBBBH',
+    'DWCWDDDWCWDD',
+    '.WWW...WWW..',
+  ],
+};
+const CAR_BEAM = 11;              // headlight beam length in art px
+const CAR_EVERY = CFG.cars.everySeconds * 1000;
+
+function buildCarSprite(shape, color, dir, noBeam = false) {
+  const rows = CAR_SHAPES[shape], cw = rows[0].length, ch = rows.length;
+  const carX = 2, sw = carX + cw + CAR_BEAM;
+  const c = makeCanvas(sw, ch), g = c.getContext('2d');
+  const body = mix(color, '#14122a', .35);
+  const cols = {
+    L: mix(body, '#c8c4e8', .28), B: body, D: mix(body, '#05040b', .45),
+    G: CFG.cars.colors.glass, H: CFG.cars.colors.headlights, T: CFG.cars.colors.taillights, W: '#2c2a35', C: '#7c798e', Y: '#ffe58a',
+  };
+  // headlight beam: a faint cone angled down onto the road, fading with distance
+  const hy = rows.findIndex(r => r.includes('H')), hx = carX + rows[hy].indexOf('H');
+  for (let i = 1; i <= (noBeam ? 0 : CAR_BEAM); i++) {
+    const a = .09 * Math.pow(1 - i / (CAR_BEAM + 1), 1.5);
+    const y0 = hy + Math.floor(i / 6);                    // drops toward the tarmac
+    const y1 = Math.min(ch - 1, hy + 1 + Math.floor(i / 4));
+    g.fillStyle = rgba(CFG.cars.colors.headlights, +a.toFixed(3));
+    g.fillRect(hx + i, y0, 1, y1 - y0 + 1);
+  }
+  // faint red glow off the tail light
+  const ty = rows.findIndex(r => r.includes('T'));
+  g.fillStyle = rgba(CFG.cars.colors.taillights, .3); g.fillRect(carX - 1, ty, 1, 1);
+  g.fillStyle = rgba(CFG.cars.colors.taillights, .12); g.fillRect(carX - 2, ty, 1, 1);
+  rows.forEach((r, y) => [...r].forEach((k, x) => {
+    if (k === '.') return;
+    g.fillStyle = cols[k];
+    g.fillRect(carX + x, y, 1, 1);
+  }));
+  if (dir > 0) return c;
+  const f = makeCanvas(sw, ch), fg = f.getContext('2d');
+  fg.translate(sw, 0); fg.scale(-1, 1); fg.drawImage(c, 0, 0);
+  return f;
+}
+
+// lane 0 = far lane (heading left), lane 1 = near lane (heading right)
+function spawnCar(scene, t, lane = Math.random() < .5 ? 0 : 1) {
+  const { W, H, horizon } = scene;
+  const dir = lane === 0 ? -1 : 1;
+  const taxi = Math.random() < CFG.cars.taxiChance;
+  const shape = taxi ? 'taxi' : ['sedan', 'sedan', 'hatch', 'van'][Math.floor(Math.random() * 4)];
+  const color = taxi ? '#e8b923' : pickOf(CFG.cars.colors.bodies);
+  const img = buildCarSprite(shape, color, dir);
+  const roadTop = horizon + 4, laneY = roadTop + Math.floor((H - roadTop) / 2);
+  const y = lane === 0 ? laneY - img.height : H - 1 - img.height;
+  const x0 = dir > 0 ? -img.width : W;
+  const same = scene.cars.filter(c => c.lane === lane);
+  if (same.some(c => c.held)) return false;                              // something's happening in this lane…
+  if (same.some(c => Math.abs(c.x - x0) < img.width + 8)) return false; // lane entrance busy
+  // never faster than the car ahead, so nobody drives through anybody
+  let speed = CFG.cars.speed[0] + Math.random() * (CFG.cars.speed[1] - CFG.cars.speed[0]);
+  for (const c of same) speed = Math.min(speed, c.speed);
+  const cw = CAR_SHAPES[shape][0].length;
+  scene.cars.push({
+    img, lane, dir, x0, x: x0, y, speed, t0: t, shape, color,
+    centre: dir > 0 ? 2 + cw / 2 : img.width - 2 - cw / 2,  // body centre within the sprite
+    held: false, lift: 0, alpha: 1,
+  });
+  return true;
+}
+
+function updateCars(scene, t) {
+  for (const c of scene.cars) if (!c.held) c.x = c.x0 + c.dir * c.speed * (t - c.t0) / 1000;
+  scene.cars = scene.cars.filter(c => (c.dir > 0 ? c.x < scene.W + 1 : c.x > -c.img.width - 1));
+  if (scene.carNext === undefined) scene.carNext = t + Math.random() * CAR_EVERY;
+  if (t >= scene.carNext) {
+    scene.carNext = t + CAR_EVERY * (.5 + Math.random());
+    if (Math.random() < CFG.cars.chance) spawnCar(scene, t);
+  }
+}
+
+function drawCars(ctx, scene, px) {
+  for (const lane of [0, 1]) for (const c of scene.cars) {
+    if (c.lane !== lane) continue;
+    ctx.globalAlpha = c.alpha;
+    ctx.drawImage(c.img, Math.round(c.x * px), Math.round((c.y - c.lift) * px), c.img.width * px, c.img.height * px);
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* ------------------------------------------------------------------
+ * Pedestrians
+ * ------------------------------------------------------------------ */
+// 3×7 figures, two walking frames. H = hair (or hat), S = skin, C = coat, L = legs
+const PED_FRAMES = [
+  ['.H.', '.S.', 'CCC', 'CCC', '.C.', 'L.L', 'L.L'],  // stride
+  ['.H.', '.S.', 'CCC', 'CCC', '.C.', '.L.', '.L.'],  // passing
+];
+const PED_HAT = 'HHH';
+const PED_EVERY = CFG.pedestrians.everySeconds * 1000;
+const pickOf = arr => arr[Math.floor(Math.random() * arr.length)];
+
+function buildPedFrames(look) {
+  const night = c => mix(c, '#14122a', .3);
+  const cols = {
+    H: night(look.hat ? look.hatColor : look.hair), S: night(look.skin),
+    C: night(look.coat), L: mix(night(look.coat), '#07060e', .55),
+  };
+  return PED_FRAMES.map(rows => {
+    const c = makeCanvas(3, rows.length), g = c.getContext('2d');
+    rows.forEach((r, y) => {
+      if (y === 0 && look.hat) r = PED_HAT;
+      [...r].forEach((k, x) => { if (k !== '.') { g.fillStyle = cols[k]; g.fillRect(x, y, 1, 1); } });
+    });
+    return c;
+  });
+}
+
+function spawnPedestrian(scene, t) {
+  const P = CFG.pedestrians;
+  const dir = Math.random() < .5 ? 1 : -1;
+  const look = {
+    hair: pickOf(P.colors.hair), skin: pickOf(P.colors.skin), coat: pickOf(P.colors.coats),
+    hat: Math.random() < .2, hatColor: pickOf(['#2a2630', '#4a3a2c', '#3a3f55']),
+  };
+  const frames = buildPedFrames(look);
+  const feet = scene.horizon + (Math.random() < .5 ? 1 : 2); // two depths on the pavement
+  const x0 = dir > 0 ? -3 : scene.W;
+  const speed = P.speed[0] + Math.random() * (P.speed[1] - P.speed[0]);
+  scene.peds.push({
+    frames, dir, x0, x: x0, y: feet - frames[0].height + 1, feet, speed, t0: t,
+    centre: 1.5, held: false, heldAt: 0, lift: 0, alpha: 1,
+  });
+}
+
+function updatePedestrians(scene, t) {
+  for (const p of scene.peds) if (!p.held) p.x = p.x0 + p.dir * p.speed * (t - p.t0) / 1000;
+  scene.peds = scene.peds.filter(p => (p.dir > 0 ? p.x < scene.W + 1 : p.x > -4));
+  if (scene.pedNext === undefined) scene.pedNext = t + Math.random() * PED_EVERY;
+  if (t >= scene.pedNext) {
+    scene.pedNext = t + PED_EVERY * (.5 + Math.random());
+    if (Math.random() < CFG.pedestrians.chance) spawnPedestrian(scene, t);
+  }
+}
+
+function drawPedestrians(ctx, scene, t, px) {
+  const peds = [...scene.peds].sort((a, b) => a.feet - b.feet); // further back first
+  for (const p of peds) {
+    const walked = p.speed * ((p.held ? p.heldAt : t) - p.t0) / 1000;
+    const img = p.frames[p.held ? 1 : Math.floor(walked / 1.5) % 2]; // a step every 1.5 art px
+    ctx.globalAlpha = p.alpha;
+    ctx.drawImage(img, Math.round(p.x * px), Math.round((p.y - p.lift) * px), img.width * px, img.height * px);
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* ------------------------------------------------------------------
+ * UFO — very rare, deliberately not in config.js
+ * ------------------------------------------------------------------ */
+const UFO_PERIOD = 10 * 60 * 1000;  // one roll every 10 minutes
+const UFO_CHANCE = .05;             // …with this chance (≈ once every 3+ hours)
+const UFO_DURATION = 10 * 1000;     // time it spends darting around the sky
+const UFO_FADE = 800;
+const UFO_SHAPE = [
+  '....ggg....',
+  '...ggggg...',
+  '.LLLLLLLLL.',
+  'BBBBBBBBBBB',
+  '..DDDDDDD..',
+];
+const UFO_LIGHTS = [1, 3, 5, 7, 9]; // x positions on row 3
+let ufoSprite = null;
+
+function getUfoSprite() {
+  if (ufoSprite) return ufoSprite;
+  const cols = { g: 'rgba(127,220,196,0.85)', L: '#a9aec2', B: '#6d7286', D: '#3d4153' };
+  const c = makeCanvas(UFO_SHAPE[0].length, UFO_SHAPE.length), g = c.getContext('2d');
+  UFO_SHAPE.forEach((r, y) => [...r].forEach((k, x) => {
+    if (k === '.') return;
+    g.fillStyle = cols[k]; g.fillRect(x, y, 1, 1);
+  }));
+  return (ufoSprite = c);
+}
+
+function updateUfo(scene, t) {
+  const period = Math.floor(t / UFO_PERIOD);
+  if (scene.ufoPeriod === undefined) {
+    scene.ufoPeriod = period;
+    const end = (period + 1) * UFO_PERIOD;
+    scene.ufoAt = Math.random() < UFO_CHANCE ? t + Math.random() * (end - t) : Infinity;
+  } else if (period !== scene.ufoPeriod) {
+    scene.ufoPeriod = period;
+    scene.ufoAt = Math.random() < UFO_CHANCE ? (period + Math.random()) * UFO_PERIOD : Infinity;
+  }
+  if (t >= scene.ufoAt) {
+    // every visit starts the same way; some of them may end in an abduction
+    spawnUfo(scene, t, Math.random() < ABDUCT_CHANCE);
+    scene.ufoAt = Infinity;
+  }
+  const u = scene.ufo;
+  if (!u) return;
+  const e = t - u.t0;
+  if (u.abduct && !u.decided && e >= u.dartEnd) {
+    u.decided = true;
+    const targets = abductionTargets(scene);
+    if (targets.length) {
+      // rise to clear sky above the chosen target, then hand over to the
+      // foreground abduction from exactly that spot
+      const tg = pickOf(targets);
+      tg.o.held = true;
+      if (tg.kind === 'ped') tg.o.heldAt = t;
+      const cur = ufoPos(u, e, false);
+      const dest = clearSkyAbove(scene, tg.o.x + tg.o.centre + (Math.random() - .5) * 30);
+      u.legs.push({ start: e, end: e + 1400, x0: cur.x, y0: cur.y, x1: dest.x, y1: dest.y });
+      u.handoff = e + 1400; u.target = tg; u.end = Infinity;
+    } else {
+      u.end = e + UFO_FADE;            // nobody about — just fade away as usual
+    }
+  }
+  if (u.handoff !== undefined && e >= u.handoff) {
+    const p = ufoPos(u, e, false);
+    startAbduction(scene, t, u.target, { cx: p.x + UFO_SHAPE[0].length / 2, y: p.y, bob0: e });
+    scene.ufo = null;
+    return;
+  }
+  if (e > u.end) scene.ufo = null;
+}
+
+// A chain of random waypoints: dart (smooth start/stop), pause, dart again…
+// An abducting visit darts a little less, leaving time to come down.
+function spawnUfo(scene, t, abduct = false) {
+  const { W, horizon } = scene;
+  const rx = () => W * (.1 + Math.random() * .8) - 5;
+  const ry = () => horizon * (.08 + Math.random() * .4);
+  const legs = [];
+  const dartFor = abduct ? UFO_DURATION - 1500 : UFO_DURATION;
+  let at = 0, x = rx(), y = ry();
+  while (at < dartFor) {
+    const hold = 500 + Math.random() * 1300, move = 500 + Math.random() * 600;
+    const nx = rx(), ny = ry();
+    legs.push({ start: at + hold, end: at + hold + move, x0: x, y0: y, x1: nx, y1: ny });
+    at += hold + move; x = nx; y = ny;
+  }
+  // an abducting visit stays until it has decided what to do (its last dart can
+  // run a little past the usual 10s); `end` is then set by that decision
+  scene.ufo = { t0: t, legs, sx: legs[0].x0, sy: legs[0].y0, abduct, dartEnd: at, end: abduct ? Infinity : UFO_DURATION };
+}
+
+// A spot high in open sky near x, with no building, antenna or sign under the saucer
+function clearSkyAbove(scene, cx) {
+  const w = UFO_SHAPE[0].length, h = UFO_SHAPE.length;
+  cx = Math.min(scene.W - w, Math.max(w, cx));
+  const x0 = cx - w / 2 - 2, x1 = cx + w / 2 + 2;
+  let top = scene.horizon;
+  for (const l of scene.layers) for (const b of l.buildings) {
+    for (const r of [...b.rects, ...b.props, ...b.signs]) {
+      if (r.x < x1 && r.x + r.w > x0) top = Math.min(top, r.y);
+    }
+    for (const bc of b.beacons) if (bc.x >= x0 - 1 && bc.x <= x1 + 1) top = Math.min(top, bc.y - 1);
+  }
+  const y = Math.max(1, Math.min(scene.horizon * .12, top - h - 6));
+  return { x: cx - w / 2, y };
+}
+
+function ufoPos(u, e, bob = true) {
+  let x = u.sx, y = u.sy;
+  for (const l of u.legs) {
+    if (e < l.start) { x = l.x0; y = l.y0; break; }
+    if (e < l.end) {
+      const p = (e - l.start) / (l.end - l.start), k = p * p * (3 - 2 * p);
+      x = l.x0 + (l.x1 - l.x0) * k; y = l.y0 + (l.y1 - l.y0) * k;
+      break;
+    }
+    x = l.x1; y = l.y1;
+  }
+  return { x, y: y + (bob ? Math.sin(e / 1000 * 2.4) * .7 : 0) }; // gentle hover bob
+}
+
+function drawUfo(ctx, scene, t, px) {
+  const u = scene.ufo;
+  if (!u) return;
+  const e = t - u.t0;
+  const { x, y } = ufoPos(u, e);
+  const alpha = Math.min(1, e / UFO_FADE, (u.end - e) / UFO_FADE);
+  if (alpha <= 0) return;
+  ctx.globalAlpha = alpha;
+  drawUfoBody(ctx, Math.round(x * px), Math.round(y * px), px, t);
+  ctx.globalAlpha = 1;
+}
+
+// The saucer at (sx, sy) in screen px, `u` screen px per sprite pixel
+function drawUfoBody(ctx, sx, sy, u, t) {
+  const spr = getUfoSprite();
+  // soft green glow beneath
+  ctx.fillStyle = 'rgba(158,255,216,0.08)';
+  ctx.fillRect(sx + u, sy + 5 * u, 9 * u, u);
+  ctx.fillRect(sx + 3 * u, sy + 6 * u, 5 * u, u);
+  ctx.drawImage(spr, sx, sy, spr.width * u, spr.height * u);
+  // rim lights: a slow, smooth wave travelling around the hull
+  UFO_LIGHTS.forEach((lx, i) => {
+    const v = .5 + .5 * Math.sin(t * .003 - i * 1.1);
+    ctx.fillStyle = `rgba(158,255,216,${(.35 + .65 * v).toFixed(2)})`;
+    ctx.fillRect(sx + lx * u, sy + 3 * u, u, u);
+  });
+}
+
+/* ------------------------------------------------------------------
+ * Abduction — the UFO occasionally comes right into the foreground and
+ * beams up a pedestrian or a car. Also deliberately not in config.js.
+ * ------------------------------------------------------------------ */
+const ABDUCT_CHANCE = .25;          // share of UFO visits that end by coming down (if someone's on screen)
+const AB_SCALE = 3;                 // saucer size in the foreground
+const AB = { descend: 3000, beamIn: 900, lift: 3400, beamOut: 700, leave: 2600 };
+const AB_T1 = AB.descend, AB_T2 = AB_T1 + AB.beamIn, AB_T3 = AB_T2 + AB.lift,
+      AB_T4 = AB_T3 + AB.beamOut, AB_T5 = AB_T4 + AB.leave;
+const clamp01 = v => Math.min(1, Math.max(0, v));
+
+function abductionTargets(scene) {
+  const { W } = scene;
+  const peds = scene.peds.filter(p => !p.held && p.x > 8 && p.x < W - 11);
+  // only a car that's alone in its lane, so nothing drives into it while it's stopped
+  const cars = scene.cars.filter(c => {
+    const cx = c.x + c.centre;
+    return !c.held && cx > 12 && cx < W - 12 && scene.cars.filter(o => o.lane === c.lane).length === 1;
+  });
+  return [...peds.map(o => ({ kind: 'ped', o })), ...cars.map(o => ({ kind: 'car', o }))];
+}
+
+// Takes over from the small sky UFO: `from` = its centre x, top y and bob phase.
+// The saucer grows from normal size to AB_SCALE as it comes down to the target.
+function startAbduction(scene, t, tg, from) {
+  if (scene.abduction) return false;
+  const { kind, o } = tg;
+  o.held = true;
+  if (kind === 'ped') o.heldAt = o.heldAt || t;
+  else o.img = buildCarSprite(o.shape, o.color, o.dir, true); // headlight pool shouldn't float up too
+  const sw = UFO_SHAPE[0].length, sh = UFO_SHAPE.length;
+  const th = kind === 'ped' ? o.frames[0].height : o.img.height;
+  const tx = o.x + o.centre;
+  scene.abduction = {
+    t0: t, kind, o, tx, th, tTop: o.y, sw, sh,
+    hoverY: o.y - 24 - sh * AB_SCALE,
+    startCx: from.cx, startY: from.y, bob0: from.bob0 || 0,
+    leaveCx: tx + (Math.random() - .5) * 70,
+    bodyW: kind === 'ped' ? 3 : CAR_SHAPES[o.shape][0].length,
+  };
+  return true;
+}
+
+// centre x, top y and scale of the saucer at e ms into the abduction
+function abductionUfoPos(a, e) {
+  let cx, y, scale;
+  if (e < AB_T1) {
+    const p = e / AB.descend, k = p * p * (3 - 2 * p);         // ease out of the sky, settle gently
+    cx = a.startCx + (a.tx - a.startCx) * k;
+    y = a.startY + (a.hoverY - a.startY) * k;
+    scale = 1 + (AB_SCALE - 1) * k;
+  } else if (e < AB_T4) {
+    cx = a.tx; y = a.hoverY; scale = AB_SCALE;
+  } else {
+    const p = (e - AB_T4) / AB.leave, k = p * p * p;           // ease away, speeding up
+    cx = a.tx + (a.leaveCx - a.tx) * k;
+    y = a.hoverY + (-a.sh * AB_SCALE - 12 - a.hoverY) * k;
+    scale = AB_SCALE;
+  }
+  return { cx, y: y + Math.sin((e + a.bob0) / 1000 * 2.4) * .7, scale };
+}
+
+function updateAbduction(scene, t) {
+  const a = scene.abduction;
+  if (!a) return;
+  const e = t - a.t0;
+  // rise from the ground to just under the hull, fading in the last stretch
+  const lp = clamp01((e - AB_T2) / AB.lift), k = lp * lp * (3 - 2 * lp);
+  const top = a.hoverY + a.sh * AB_SCALE - a.th * .4;
+  a.o.lift = (a.tTop - top) * k;
+  a.o.alpha = lp < .7 ? 1 : clamp01(1 - (lp - .7) / .3);
+  if (lp >= 1 && !a.taken) {
+    a.taken = true;
+    if (a.kind === 'ped') scene.peds = scene.peds.filter(p => p !== a.o);
+    else scene.cars = scene.cars.filter(c => c !== a.o);
+  }
+  if (e > AB_T5) scene.abduction = null;
+}
+
+function drawAbduction(ctx, scene, t, px) {
+  const a = scene.abduction;
+  if (!a) return;
+  const e = t - a.t0;
+  const { cx, y, scale } = abductionUfoPos(a, e);
+  const beam = e < AB_T1 ? 0 : e < AB_T2 ? (e - AB_T1) / AB.beamIn
+             : e < AB_T3 ? 1 : e < AB_T4 ? 1 - (e - AB_T3) / AB.beamOut : 0;
+  if (beam > 0) {
+    // tractor beam: a widening cone of soft green, art-pixel rows, with faint
+    // bands drifting slowly upward
+    const yTop = Math.round(y + a.sh * AB_SCALE - 1), yBot = Math.round(a.tTop + a.th);
+    const topW = 7 * AB_SCALE, botW = a.bodyW + 8;
+    for (let yy = yTop; yy <= yBot; yy++) {
+      const f = (yy - yTop) / Math.max(1, yBot - yTop);
+      const half = (topW + (botW - topW) * f) / 2;
+      const band = ((yy + t * .008) % 7 + 7) % 7 < 1.5 ? .05 : 0;
+      ctx.fillStyle = `rgba(158,255,216,${((.1 + band) * beam).toFixed(3)})`;
+      ctx.fillRect(Math.round((cx - half) * px), yy * px, Math.round(half * 2 * px), px);
+      ctx.fillStyle = `rgba(200,255,235,${(.06 * beam).toFixed(3)})`;
+      ctx.fillRect(Math.round((cx - half * .45) * px), yy * px, Math.round(half * .9 * px), px);
+    }
+  }
+  // whole screen px per saucer pixel keeps it crisp while it grows
+  const u = Math.max(px, Math.round(px * scale));
+  drawUfoBody(ctx, Math.round(cx * px - a.sw * u / 2), Math.round(y * px), u, t);
+}
+
+/* ------------------------------------------------------------------
+ * Compose
+ * ------------------------------------------------------------------ */
+// The scene is drawn in passes so moving things glide smoothly:
+//   back   (art-res buffer):  sky, stars, shooting stars
+//   moon, clouds, UFO (full screen res): art-pixel bitmaps scaled up, positioned to
+//                             the nearest *screen* pixel → crisp but smooth
+//   front  (art-res, transparent): buildings, street, sidewalk lamps
+//   cars   (full screen res)
+//   fg     (art-res, transparent): lamp posts nearest the viewer
+function renderBack(ctx, scene, caches, t) {
+  updateWindows(scene, t);
+  updateMeteors(scene, t);
+  updateClouds(scene, t);
+  updateCars(scene, t);
+  updatePedestrians(scene, t);
+  updateUfo(scene, t);
+  updateAbduction(scene, t);
+  updateMoon(scene, t);
+  updateRimSide(scene, caches, t);
+  ctx.drawImage(caches.sky, 0, 0);
+  drawStars(ctx, scene, t);
+  drawMeteors(ctx, scene, t);
+}
+
+// Buildings are outlined on the side facing the moon. When the moon crosses
+// the middle of the sky the outlines swap sides with a slow cross-fade.
+const RIM_FADE = 4000;
+function updateRimSide(scene, caches, t) {
+  const litLeft = scene.moon.cx < scene.W / 2;
+  if (litLeft === caches.litLeft) return;
+  caches.prevLayers = caches.layers;
+  caches.layers = scene.layers.map(l => buildLayer(scene, l, litLeft));
+  caches.litLeft = litLeft;
+  caches.fadeT0 = t;
+}
+
+function renderFront(ctx, scene, caches, t) {
+  ctx.clearRect(0, 0, scene.W, scene.H);
+  const fade = caches.prevLayers ? (t - caches.fadeT0) / RIM_FADE : 1;
+  if (fade >= 1) caches.prevLayers = null;
+  scene.layers.forEach((layer, i) => {
+    if (caches.prevLayers) {
+      ctx.drawImage(caches.prevLayers[i], 0, 0);
+      ctx.globalAlpha = Math.max(0, fade);
+    }
+    ctx.drawImage(caches.layers[i], 0, 0);
+    ctx.globalAlpha = 1;
+    drawWindows(ctx, layer, t);
+    drawSigns(ctx, layer, t);
+    drawBeacons(ctx, layer, t);
+    if (caches.haze[i]) ctx.drawImage(caches.haze[i], 0, 0);
+  });
+  ctx.drawImage(caches.street, 0, 0);
+  drawLamps(ctx, scene, t);
+}
+
+function renderFg(ctx, scene, caches) {
+  ctx.clearRect(0, 0, scene.W, scene.H);
+  ctx.drawImage(caches.foreground, 0, 0);
+  drawForegroundLamps(ctx, scene);
+}
+
+/* ------------------------------------------------------------------
+ * App: sizing, seed, resize, input
+ * ------------------------------------------------------------------ */
+const canvas = document.getElementById('city');
+const ctx = canvas.getContext('2d');
+const backBuf = makeCanvas(1, 1), backCtx = backBuf.getContext('2d');
+const frontBuf = makeCanvas(1, 1), frontCtx = frontBuf.getContext('2d');
+const fgBuf = makeCanvas(1, 1), fgCtx = fgBuf.getContext('2d');
+
+let seed = parseSeed();
+let scene = null, caches = null, rafId = 0;
+
+// fixed seed in config.js → URL #seed → random
+function parseSeed() {
+  if (Number.isFinite(CFG.display.seed)) return CFG.display.seed >>> 0;
+  const n = parseInt(location.hash.slice(1), 10);
+  return Number.isFinite(n) ? n >>> 0 : (Math.random() * 2 ** 32) >>> 0;
+}
+
+function setup() {
+  const dpr = window.devicePixelRatio || 1;
+  const cw = Math.max(1, Math.floor(innerWidth * dpr));
+  const ch = Math.max(1, Math.floor(innerHeight * dpr));
+  canvas.width = cw; canvas.height = ch;
+
+  const px = Math.max(1, Math.round(ch / TARGET_ROWS)); // size of one art pixel in device px
+  const W = Math.ceil(cw / px), H = Math.ceil(ch / px);
+  backBuf.width = frontBuf.width = fgBuf.width = W;
+  backBuf.height = frontBuf.height = fgBuf.height = H;
+
+  scene = generateScene(seed, W, H);
+  scene.px = px;
+  caches = buildCaches(scene);
+  history.replaceState(null, '', '#' + seed);
+  draw(performance.now());
+}
+
+function draw(t) {
+  const { px, W, H } = scene;
+  renderBack(backCtx, scene, caches, t);
+  renderFront(frontCtx, scene, caches, t);
+  renderFg(fgCtx, scene, caches);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(backBuf, 0, 0, W * px, H * px);
+  drawMoon(ctx, scene, t, px, caches.moon);
+  drawClouds(ctx, scene, px);
+  drawUfo(ctx, scene, t, px);
+  ctx.drawImage(frontBuf, 0, 0, W * px, H * px);
+  drawPedestrians(ctx, scene, t, px);
+  drawCars(ctx, scene, px);
+  ctx.drawImage(fgBuf, 0, 0, W * px, H * px);
+  drawAbduction(ctx, scene, t, px);   // in front of everything
+}
+
+function loop(t) {
+  draw(t);
+  rafId = requestAnimationFrame(loop);
+}
+
+function regenerate() {
+  seed = (Math.random() * 2 ** 32) >>> 0;
+  setup();
+}
+
+let resizeTimer = 0;
+addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(setup, 100); });
+if (CFG.display.clickToRegenerate) canvas.addEventListener('click', regenerate);
+else canvas.style.cursor = 'default';
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'r' && CFG.display.clickToRegenerate) regenerate();
+  if (k === 's') shootingStar();
+  if (k === 'c') { spawnCar(scene, performance.now()); if (!ANIMATE) draw(performance.now()); }
+  if (k === 'p') { spawnPedestrian(scene, performance.now()); if (!ANIMATE) draw(performance.now()); }
+  // U = a visit exactly like a natural one (same chance of ending in an abduction)
+  if (k === 'u' && !scene.ufo && !scene.abduction) { spawnUfo(scene, performance.now(), Math.random() < ABDUCT_CHANCE); if (!ANIMATE) draw(performance.now()); }
+  if (k === 'a') testAbduction();
+});
+
+// testing helper (A key): a UFO visit that's sure to end in an abduction —
+// it zips around the sky first, then comes down. Sends a pedestrian along
+// mid-pavement if there's nobody suitable on screen.
+function testAbduction() {
+  const now = performance.now();
+  if (scene.ufo || scene.abduction) return;
+  if (!abductionTargets(scene).length) {
+    spawnPedestrian(scene, now);
+    const p = scene.peds[scene.peds.length - 1];
+    p.x0 = p.x = Math.round(scene.W * (.35 + Math.random() * .3));
+  }
+  spawnUfo(scene, now, true);
+  if (!ANIMATE) draw(now);
+}
+
+// testing helper: fire a shooting star right now
+function shootingStar() {
+  spawnMeteor(scene, performance.now());
+  if (!ANIMATE) draw(performance.now());
+}
+
+setup();
+if (ANIMATE) rafId = requestAnimationFrame(loop);
+
+// exposed for poking at from the console / future animation work
+window.cityscape = { get scene() { return scene; }, draw, setup, regenerate, shootingStar };
+</script>
+</body>
+</html>

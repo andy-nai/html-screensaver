@@ -1199,8 +1199,10 @@ function drawPedestrians(ctx, scene, t, px) {
 /* ------------------------------------------------------------------
  * UFO — very rare, deliberately not in config.js
  * ------------------------------------------------------------------ */
-const UFO_PERIOD = 10 * 60 * 1000;  // one roll every 10 minutes
-const UFO_CHANCE = .05;             // …with this chance (≈ once every 3+ hours)
+// the rare visitor: checked once a minute with a 1-in-30 chance (about once every 30 minutes, like
+// every scene's rare visitor), and 1 visit in 10 ends in an abduction
+const UFO_PERIOD = 60 * 1000;
+const UFO_CHANCE = 1 / 30;
 const UFO_DURATION = 10 * 1000;     // time it spends darting around the sky
 const UFO_FADE = 800;
 const UFO_SHAPE = [
@@ -1350,7 +1352,7 @@ function drawUfoBody(ctx, sx, sy, u, t) {
  * Abduction — the UFO occasionally comes right into the foreground and
  * beams up a pedestrian or a car. Also deliberately not in config.js.
  * ------------------------------------------------------------------ */
-const ABDUCT_CHANCE = .25;          // share of UFO visits that end by coming down (if someone's on screen)
+const ABDUCT_CHANCE = 1 / 10;       // share of UFO visits that end by coming down (if someone's on screen)
 const AB_SCALE = 3;                 // saucer size in the foreground
 const AB = { descend: 3000, beamIn: 900, lift: 3400, beamOut: 700, leave: 2600 };
 const AB_T1 = AB.descend, AB_T2 = AB_T1 + AB.beamIn, AB_T3 = AB_T2 + AB.lift,

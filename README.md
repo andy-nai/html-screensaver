@@ -16,7 +16,7 @@ HtmlScreensaver\
   README.md
 ```
 
-The `scenes` folder always sits next to the `.scr`. Copy the whole folder to move it to another PC.
+The `scenes` folder always sits next to the `.scr`.
 
 ## Install (on any PC)
 
@@ -41,15 +41,11 @@ Uninstall: run `uninstall.ps1`, then delete the folder.
 
 ### Making a scene
 
-Each scene is a plain web page, so you can develop it in a browser before trying it in the screensaver.
-Serve the `scenes` folder locally (this is what `.claude/launch.json` does) and open
-`http://localhost:8123/<scene-name>/`:
+1. Create an `index.html` (plus any scripts, images or other files it uses).
+2. Create a sub-folder under `scenes\` named after your scene, e.g. `scenes\my-scene\`.
+3. Drop the files in there. That's it: the screensaver will pick it up next time it starts.
 
-```powershell
-cd scenes; python -m http.server 8123
-```
-
-Then check it full screen with `HtmlScreensaver.scr /debug /scene:<scene-name>`.
+To try it straight away: `.\HtmlScreensaver.scr /debug /scene:my-scene`
 
 ## Building from source
 

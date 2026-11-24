@@ -1,0 +1,804 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rainy Window</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #07081a; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; image-rendering: pixelated; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<!-- optional user settings; the page falls back to the defaults below if it's missing -->
+<script>
+  document.write('<script src="config.js?v=' + Date.now() + '"><\/script>');
+</script>
+<script>
+'use strict';
+
+/* ------------------------------------------------------------------
+ * Config — defaults, overridden by config.js (window.RAIN_CONFIG)
+ * ------------------------------------------------------------------ */
+const DEFAULTS = {
+  display: { targetRows: 240, animate: true, frameRate: 24, seed: null, clickToRegenerate: true },
+  city: {
+    blur: 3, bokeh: 40,
+    colors: {
+      sky: ['#07081a', '#0e1026', '#191834', '#2a2042', '#3c2a4a'],
+      buildings: ['#14162a', '#0b0c18'],
+      windows: ['#ffcf7a', '#ffe0a8', '#a8d0ff', '#ff9a6a'],
+      lights: ['#ffd27a', '#ff6a5a', '#7ae0ff', '#ff5ad0', '#a0ff8a', '#ffb04a'],
+    },
+  },
+  traffic: {
+    everySeconds: 5, chance: .7,
+    types: { sedan: 4, hatch: 3, suv: 3, van: 1.5, bus: .5 }, nightShade: .45,
+    colors: {
+      headlights: '#fff2d0', taillights: '#ff3a3a',
+      bodies: ['#d8dce4', '#f0f0f4', '#a8aeb8', '#202028', '#5a5e66', '#b02028', '#1e4a8a', '#2e6a44', '#e0a820', '#6a3a1e', '#4a2e6a', '#2a8a9a'],
+    },
+  },
+  rain: { intensity: 1, heavyMinutes: 6, lightest: .25, maxDrops: 1, colors: { drop: '#aab6d6', highlight: '#ffffff', shadow: '#05060c' } },
+  fog: { amount: .5, colors: { fog: '#8a96b8' } },
+  glass: { smudges: 1, colors: { smudge: '#c8d0e8' } },
+  lightning: { everyMinutes: 6, chance: .3 },
+  frame: { show: true, colors: { wood: '#2a1e1c', edge: '#3e2c28', sill: '#352624', sillTop: '#4a3430' } },
+  candle: { show: true, colors: { wax: '#efe6d6', flame: '#ffd27a', glow: '#ff9a40' } },
+  cat: { everyMinutes: 10, chance: .3, sitSeconds: [20, 45], size: .34, colors: { coats: ['#141016', '#141016', '#4a4a52', '#a85a2a', '#6a5040'] } },
+  clock: { show: true, hour12: false, seconds: false, position: 'auto', font: 'segment', size: 1,
+    blinkColon: true, drift: true, glow: 1, colors: { text: '#ff4030', glow: '#ff2a1a', box: '#161214' } },
+};
+
+function mergeConfig(base, over, path = '') {
+  const out = { ...base };
+  for (const k of Object.keys(over || {})) {
+    const b = base[k], o = over[k], p = path ? `${path}.${k}` : k;
+    if (o === undefined) continue;
+    if (!(k in base)) { console.warn(`config.js: unknown setting "${p}" ignored`); continue; }
+    const isGroup = v => v && typeof v === 'object' && !Array.isArray(v);
+    out[k] = isGroup(b) && isGroup(o) ? mergeConfig(b, o, p) : o;
+  }
+  return out;
+}
+const CFG = mergeConfig(DEFAULTS, window.RAIN_CONFIG);
+const FRAME_INTERVAL = CFG.display.frameRate > 0 ? 1000 / CFG.display.frameRate : 0;
+
+/* ------------------------------------------------------------------
+ * Helpers
+ * ------------------------------------------------------------------ */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function makeRng(seed) {
+  const r = mulberry32(seed >>> 0);
+  return {
+    next: r,
+    range: (a, b) => a + r() * (b - a),
+    int: (a, b) => Math.floor(a + r() * (b - a + 1)),
+    pick: arr => arr[Math.floor(r() * arr.length)],
+    chance: p => r() < p,
+  };
+}
+const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const rgba = (c, a) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const TAU = Math.PI * 2;
+function makeCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+
+// soft round light: flat-ish centre, fading edge
+function bokeh(g, x, y, r, rgb, a) {
+  if (a <= .01 || r <= 0) return;
+  const gr = g.createRadialGradient(x, y, 0, x, y, r);
+  gr.addColorStop(0, rgba(rgb, a)); gr.addColorStop(.6, rgba(rgb, a * .75)); gr.addColorStop(1, rgba(rgb, 0));
+  g.fillStyle = gr; g.fillRect(x - r, y - r, r * 2, r * 2);
+}
+
+/* ------------------------------------------------------------------
+ * Scene generation
+ * ------------------------------------------------------------------ */
+// The road in perspective: depth z runs from 1 (just below the window) to ROAD_FAR (where it meets the
+// city); roadU turns depth into how far along the road's screen line that is (0 = far end, 1 = near end).
+const ROAD_FAR = 30;
+const roadU = z => (1 / z - 1 / ROAD_FAR) / (1 - 1 / ROAD_FAR);
+
+// Wood grain running along a bar of the frame
+function woodGrain(f, rng, x0, y0, w, h, vertical, base) {
+  const ph = rng.range(0, 100), dark = mixRgb(base, .72), light = mixRgb(base, 1.25);
+  for (let y = y0; y < y0 + h; y++) for (let x = x0; x < x0 + w; x++) {
+    const a = vertical ? y : x, c = vertical ? x : y;
+    const g = Math.sin(a * .045 + Math.sin(c * .9 + ph + a * .01) * 2.2 + c * 1.7);
+    if (g > .8) { f.fillStyle = dark; f.fillRect(x, y, 1, 1); }
+    else if (g < -.93) { f.fillStyle = light; f.fillRect(x, y, 1, 1); }
+  }
+  // a knot or two
+  for (let i = rng.int(0, 2); i > 0; i--) {
+    const kx = x0 + rng.range(.1, .9) * w, ky = y0 + rng.range(.2, .8) * h, r = Math.max(1, Math.min(w, h) * .18);
+    f.strokeStyle = dark; f.lineWidth = 1;
+    f.beginPath(); f.ellipse(kx, ky, vertical ? r : r * 2, vertical ? r * 2 : r, 0, 0, TAU); f.stroke();
+  }
+}
+function mixRgb(hex, f) { const c = hexRgb(hex); return `rgb(${Math.min(255, c[0] * f) | 0},${Math.min(255, c[1] * f) | 0},${Math.min(255, c[2] * f) | 0})`; }
+function generateScene(seed, W, H) {
+  const rng = makeRng(seed);
+  const k = H / 240;
+  const S = { seed, W, H, k, drops: [], runners: [], trails: [], cars: [], flash: null,
+    lastRoll: { car: 0, flash: 0, cat: 0 }, rainAcc: 0, cat: null };
+  const CC = CFG.city.colors;
+
+  // window frame and glass area
+  const fw = CFG.frame.show ? Math.round(8 * k) : 0, sillH = CFG.frame.show ? Math.round(20 * k) : 0;
+  S.glass = { x0: fw, y0: fw, x1: W - fw, y1: H - sillH };
+
+  // the city, drawn sharp then blurred
+  const pad = Math.round(20 * k), cw = W + pad * 2, ch = H + pad * 2;
+  const city = makeCanvas(cw, ch), c = city.getContext('2d');
+  const sky = c.createLinearGradient(0, 0, 0, ch);
+  CC.sky.forEach((col, i) => sky.addColorStop(i / (CC.sky.length - 1), col));
+  c.fillStyle = sky; c.fillRect(0, 0, cw, ch);
+  const street = Math.round(ch * rng.range(.55, .62));    // seen from an upper floor, so the street is well below the horizon
+  S.street = street - pad;
+  CC.buildings.forEach((col, layer) => {
+    for (let x = -5; x < cw;) {
+      const bw = Math.round(rng.range(18, 50) * k * (layer ? 1.4 : 1));
+      const bh = Math.round(ch * rng.range(.25, .62) * (layer ? 1.1 : .85));
+      const top = street - bh;
+      c.fillStyle = col; c.fillRect(x, top, bw, bh);
+      const cell = Math.round((layer ? 6 : 4) * k), lit = rng.range(.15, .45);
+      for (let wy = top + cell; wy < street - cell; wy += cell) for (let wx = x + Math.round(cell / 2); wx < x + bw - cell / 2; wx += cell) {
+        if (!rng.chance(lit)) continue;
+        c.fillStyle = rng.pick(CC.windows); c.globalAlpha = rng.range(.5, 1);
+        c.fillRect(wx, wy, Math.max(1, Math.round(cell * .55)), Math.max(1, Math.round(cell * .5)));
+      }
+      c.globalAlpha = 1;
+      // the odd neon sign
+      if (rng.chance(.25)) {
+        c.fillStyle = rng.pick(CC.lights);
+        c.fillRect(x + rng.int(1, Math.max(1, bw - 6)), top + rng.int(4, Math.max(5, Math.round(bh * .5))), Math.max(2, Math.round(3 * k)), Math.round(rng.range(8, 20) * k));
+      }
+      x += bw + rng.int(0, Math.round(6 * k));
+    }
+  });
+  c.fillStyle = '#07070e'; c.fillRect(0, street, cw, ch - street);
+  c.fillStyle = '#1a1626'; c.fillRect(0, street, cw, Math.max(1, Math.round(2 * k)));   // wet road shine
+
+  // a road running diagonally away from below the window into the city
+  const nearLeft = rng.chance(.5);
+  const F = { x: cw * (nearLeft ? rng.range(.58, .75) : rng.range(.25, .42)), y: street + 1 };
+  const N = { x: cw * (nearLeft ? .05 : .95), y: ch + 30 * k };
+  const farHalf = 2.5 * k, nearHalf = cw * .32;
+  const along = u => ({ x: F.x + (N.x - F.x) * u, y: F.y + (N.y - F.y) * u, hw: farHalf + (nearHalf - farHalf) * u });
+  const roadGr = c.createLinearGradient(0, F.y, 0, N.y);                 // wet asphalt catching the city glow
+  roadGr.addColorStop(0, '#2a2236'); roadGr.addColorStop(.4, '#1a1726'); roadGr.addColorStop(1, '#100e18');
+  c.fillStyle = roadGr;
+  c.beginPath(); c.moveTo(F.x - farHalf, F.y); c.lineTo(F.x + farHalf, F.y); c.lineTo(N.x + nearHalf, N.y); c.lineTo(N.x - nearHalf, N.y); c.fill();
+  // dashed centre line and street lamps on both sides, spaced evenly in depth
+  for (let z = 1; z < ROAD_FAR; z *= 1.18) {
+    const p = along(roadU(z)), p2 = along(roadU(z * 1.07)), s = p.hw / nearHalf;
+    c.strokeStyle = '#4a4458'; c.lineWidth = Math.max(.5, 3 * k * s);
+    c.beginPath(); c.moveTo(p.x, p.y); c.lineTo(p2.x, p2.y); c.stroke();
+  }
+  for (let z = 1.2; z < ROAD_FAR; z *= 1.45) {
+    const p = along(roadU(z)), s = p.hw / nearHalf;
+    for (const side of [-1, 1]) {
+      const lx = p.x + side * p.hw * 1.12, poleH = Math.max(3, 110 * k * s), lr = Math.max(1, 5 * k * s);
+      c.fillStyle = '#1a1824'; c.fillRect(lx, p.y - poleH, Math.max(1, 3 * k * s), poleH);
+      c.fillStyle = CC.windows[0]; c.beginPath(); c.arc(lx, p.y - poleH, lr, 0, TAU); c.fill();
+      c.globalAlpha = .25; c.fillRect(lx - lr, p.y - poleH * .1, lr * 2, poleH * .25); c.globalAlpha = 1;   // its shine on the wet road
+    }
+  }
+  S.road = { F: { x: F.x - pad, y: F.y - pad }, N: { x: N.x - pad, y: N.y - pad }, farHalf, nearHalf, nearLeft };
+  const bg = makeCanvas(W, H), b = bg.getContext('2d');
+  b.filter = `blur(${CFG.city.blur * k}px)`;
+  b.drawImage(city, -pad, -pad);
+  b.filter = 'none';
+  S.bg = bg;
+
+  // out-of-focus lights: street lamps, signs, windows nearer the glass
+  S.bokeh = Array.from({ length: Math.round(CFG.city.bokeh * W / 427) }, () => ({
+    x: rng.range(0, W), y: rng.range(H * .3, S.street + 10 * k), r: rng.range(3, 10) * k,
+    c: hexRgb(rng.pick(rng.chance(.6) ? CC.windows : CC.lights)), a: rng.range(.12, .35),
+    flick: rng.chance(.25), ph: rng.range(0, TAU), sp: rng.range(.0005, .002),
+  }));
+
+  // candle on the sill
+  if (CFG.candle.show && CFG.frame.show) {
+    const cx = Math.round(W * (rng.chance(.5) ? rng.range(.12, .25) : rng.range(.75, .88)));
+    S.candle = { x: cx, y: H - sillH + Math.round(4 * k), w: Math.max(3, Math.round(6 * k)), h: Math.round(12 * k), ph: rng.range(0, 100) };
+  }
+
+  // frame drawn once
+  if (CFG.frame.show) {
+    const fr = makeCanvas(W, H), f = fr.getContext('2d'), FC = CFG.frame.colors;
+    f.fillStyle = FC.wood;
+    f.fillRect(0, 0, W, fw); f.fillRect(0, 0, fw, H); f.fillRect(W - fw, 0, fw, H);
+    woodGrain(f, rng, 0, 0, W, fw, false, FC.wood);
+    woodGrain(f, rng, 0, fw, fw, H - fw - sillH, true, FC.wood);
+    woodGrain(f, rng, W - fw, fw, fw, H - fw - sillH, true, FC.wood);
+    f.fillStyle = 'rgba(0,0,0,.3)'; f.fillRect(fw, fw, Math.max(1, Math.round(k)), H - fw - sillH);   // shadow where bars meet
+    f.fillStyle = FC.edge;                              // inner bevel catching the city light
+    f.fillRect(fw - 1, fw - 1, W - fw * 2 + 2, 1); f.fillRect(fw - 1, fw, 1, H - fw - sillH); f.fillRect(W - fw, fw, 1, H - fw - sillH);
+    f.fillStyle = FC.sill; f.fillRect(0, H - sillH, W, sillH);
+    woodGrain(f, rng, 0, H - sillH, W, sillH, false, FC.sill);
+    f.fillStyle = FC.sillTop; f.fillRect(0, H - sillH, W, Math.max(2, Math.round(3 * k)));
+    woodGrain(f, rng, 0, H - sillH, W, Math.max(2, Math.round(3 * k)), false, FC.sillTop);
+    f.fillStyle = 'rgba(0,0,0,.35)'; f.fillRect(0, H - sillH + Math.round(3 * k), W, 1);
+    S.frame = fr;
+  }
+
+  // fog thickens towards the bottom of the glass
+  if (CFG.fog.amount > 0) {
+    const fog = makeCanvas(W, H), fg = fog.getContext('2d'), fc = hexRgb(CFG.fog.colors.fog);
+    const gr = fg.createLinearGradient(0, S.glass.y0, 0, S.glass.y1);
+    gr.addColorStop(0, rgba(fc, .05 * CFG.fog.amount)); gr.addColorStop(.6, rgba(fc, .14 * CFG.fog.amount)); gr.addColorStop(1, rgba(fc, .32 * CFG.fog.amount));
+    fg.fillStyle = gr; fg.fillRect(S.glass.x0, S.glass.y0, S.glass.x1 - S.glass.x0, S.glass.y1 - S.glass.y0);
+    S.fog = fog;
+  }
+
+  // the glass itself isn't perfectly clean: soft smudges, dust and a few fine scratches
+  if (CFG.glass.smudges > 0) {
+    const gl = makeCanvas(W, H), gx = gl.getContext('2d'), g = S.glass, amt = CFG.glass.smudges;
+    const sc = hexRgb(CFG.glass.colors.smudge);
+    gx.save(); gx.beginPath(); gx.rect(g.x0, g.y0, g.x1 - g.x0, g.y1 - g.y0); gx.clip();
+    for (let i = rng.int(4, 8); i > 0; i--) {                            // smudges, often near the edges
+      const edge = rng.chance(.6);
+      const sx = edge ? (rng.chance(.5) ? g.x0 + rng.range(0, .18) * W : g.x1 - rng.range(0, .18) * W) : rng.range(g.x0, g.x1);
+      const sy = rng.range(g.y0, g.y1), r = rng.range(12, 35) * k;
+      const gr = gx.createRadialGradient(sx, sy, 0, sx, sy, r);
+      gr.addColorStop(0, rgba(sc, .07 * amt)); gr.addColorStop(1, rgba(sc, 0));
+      gx.fillStyle = gr; gx.fillRect(sx - r, sy - r, r * 2, r * 2);
+    }
+    for (let i = Math.round(W * H / 700 * amt); i > 0; i--) {            // dust
+      gx.fillStyle = rgba(sc, rng.range(.08, .22)); gx.fillRect(rng.int(g.x0, g.x1), rng.int(g.y0, g.y1), 1, 1);
+    }
+    for (let i = rng.int(1, 3); i > 0; i--) {                            // hairline scratches
+      const x = rng.range(g.x0, g.x1), y = rng.range(g.y0, g.y1), len = rng.range(15, 50) * k, ang = rng.range(-.6, .6) - Math.PI / 4;
+      gx.strokeStyle = rgba(sc, .12 * amt); gx.lineWidth = 1;
+      gx.beginPath(); gx.moveTo(x, y); gx.lineTo(x + Math.cos(ang) * len, y + Math.sin(ang) * len); gx.stroke();
+    }
+    gx.restore();
+    S.smudges = gl;
+  }
+
+  // clock: a little bedside clock on the sill, away from the candle (bottom right without a frame)
+  const cm = Math.round(8 * k);
+  S.clock = clockAnchor(CFG.frame.show
+    ? { x: Math.round(W * (S.candle && S.candle.x > W / 2 ? .22 : .78)), y: H - sillH + Math.round(4 * k), align: 'center', valign: 'bottom', box: true }
+    : { x: W - cm, y: H - cm, align: 'right', valign: 'bottom' }, W, H, k);
+
+  // colours seen through each spot of glass (for tinting drops)
+  S.bgData = b.getImageData(0, 0, W, H).data;
+  S.maxDrops = Math.round(W * H / 110 * CFG.rain.maxDrops);
+  S.heavyPh = rng.range(0, TAU);
+  const g = S.glass;
+  for (let i = 0; i < S.maxDrops * .6; i++) addDrop(S, g.x0 + rng.next() * (g.x1 - g.x0), g.y0 + rng.next() * (g.y1 - g.y0), .4 + rng.next() ** 2.5 * 1.7, -1e9);
+  return S;
+}
+
+/* ------------------------------------------------------------------
+ * Drops on the glass
+ * ------------------------------------------------------------------ */
+function sample(S, x, y) {
+  x = clamp(Math.round(x), 0, S.W - 1); y = clamp(Math.round(y), 0, S.H - 1);
+  const o = (y * S.W + x) * 4, d = S.bgData;
+  return [d[o], d[o + 1], d[o + 2]];
+}
+
+// a new droplet merges with any it touches; big enough and it starts to run
+function addDrop(S, x, y, r, t) {
+  r *= S.k;
+  for (let i = 0; i < S.drops.length; i++) {
+    const d = S.drops[i];
+    if (Math.abs(d.x - x) > 6 * S.k || Math.abs(d.y - y) > 6 * S.k) continue;
+    if (Math.hypot(d.x - x, d.y - y) < (d.r + r) * .9) {
+      const area = d.r * d.r + r * r;
+      d.x = (d.x * d.r * d.r + x * r * r) / area; d.y = (d.y * d.r * d.r + y * r * r) / area;
+      d.r = Math.sqrt(area);
+      if (d.r > 2.3 * S.k) { S.drops.splice(i, 1); startRunner(S, d.x, d.y, d.r, t); }
+      return;
+    }
+  }
+  S.drops.push({ x, y, r, born: t });
+  if (S.drops.length > S.maxDrops) S.drops.splice(Math.floor(Math.random() * S.drops.length * .5), 1);
+}
+
+function startRunner(S, x, y, r, t) {
+  if (S.runners.length > 8) return;
+  S.runners.push({ x, y, r, v: 0, pauseUntil: t + 300 + Math.random() * 1500, ph: Math.random() * TAU, lastY: Math.floor(y) });
+}
+
+function stepRunners(S, t, dt) {
+  const g = S.glass, life = 40000;
+  S.runners = S.runners.filter(rn => {
+    if (t < rn.pauseUntil) return true;
+    const v = (8 + rn.r / S.k * 9) * S.k / 1000;
+    rn.y += v * dt;
+    rn.x += Math.sin(rn.y * .25 + rn.ph) * .06 * S.k + (Math.random() - .5) * .08 * S.k;
+    if (Math.random() < dt / 1000 * .7) rn.pauseUntil = t + 150 + Math.random() * 900;          // stick for a moment
+    // gather the droplets in its path
+    for (let i = S.drops.length - 1; i >= 0; i--) {
+      const d = S.drops[i];
+      if (Math.abs(d.y - rn.y) > rn.r + d.r || Math.abs(d.x - rn.x) > rn.r + d.r) continue;
+      if (Math.hypot(d.x - rn.x, d.y - rn.y) < rn.r + d.r) { rn.r = Math.min(4.2 * S.k, Math.sqrt(rn.r * rn.r + d.r * d.r * .7)); S.drops.splice(i, 1); }
+    }
+    // a clear trail behind it, now and then a droplet left behind
+    for (let y = rn.lastY + 1; y <= Math.floor(rn.y); y++) {
+      const w = Math.max(1, Math.round(rn.r * 1.1));
+      S.trails.push({ x: Math.round(rn.x - w / 2), y: y - Math.round(rn.r), w, t });
+      if (Math.random() < .05) { S.drops.push({ x: rn.x + (Math.random() - .5) * rn.r, y: y - rn.r * 1.5, r: (.4 + Math.random() * .5) * S.k, born: t }); rn.r = Math.max(1.6 * S.k, rn.r - .05 * S.k); }
+    }
+    rn.lastY = Math.floor(rn.y);
+    return rn.y - rn.r < g.y1;
+  });
+  S.trails = S.trails.filter(tr => t - tr.t < life);
+  if (S.trails.length > 4000) S.trails.splice(0, S.trails.length - 4000);
+}
+
+/* ------------------------------------------------------------------
+ * Drawing
+ * ------------------------------------------------------------------ */
+function render(b, S, t) {
+  const { W, H, k } = S, g = S.glass;
+  b.drawImage(S.bg, 0, 0);
+
+  for (const o of S.bokeh) {
+    const a = o.flick ? o.a * (.5 + .5 * Math.sin(t * o.sp + o.ph)) : o.a;
+    bokeh(b, o.x, o.y, o.r, o.c, a);
+  }
+
+  // cars on the diagonal road: headlights coming towards the window, taillights going away
+  const TC = CFG.traffic.colors, hl = hexRgb(TC.headlights), tl = hexRgb(TC.taillights), R = S.road;
+  for (const car of S.cars) {
+    const z = carDepth(car, t), u = roadU(z);
+    const x = R.F.x + (R.N.x - R.F.x) * u, y = R.F.y + (R.N.y - R.F.y) * u;
+    const hw = R.farHalf + (R.nearHalf - R.farHalf) * u, s = hw / R.nearHalf;
+    // drive on the right: oncoming traffic on the left half of the road as seen from its far end
+    const side = (car.coming ? -1 : 1) * (R.nearLeft ? -1 : 1);
+    const T = CAR_TYPES[car.type] || CAR_TYPES.sedan;
+    const lx = x + side * hw * .4, sep = Math.max(.6, hw * .16 * T.w), r = Math.max(1.2, hw * .09);
+    const fade = Math.min(1, (ROAD_FAR - z) / 4) * (.55 + .4 * Math.min(1, s * 3));
+    const col = car.coming ? hl : tl;
+    // the car itself: an out-of-focus shape behind its lights
+    b.filter = `blur(${Math.max(.6, CFG.city.blur * k * .35)}px)`;
+    b.globalAlpha = Math.min(1, fade * 1.1);
+    drawCarBody(b, T, car.body, lx, y, sep * 2 + r * 3);
+    b.filter = 'none'; b.globalAlpha = 1;
+    if (car.coming) bokeh(b, lx, y, r * 4, col, .1 * fade);              // headlights light up the rain
+    bokeh(b, lx - sep, y, r, col, fade); bokeh(b, lx + sep, y, r, col, fade);
+    bokeh(b, lx, y + r * 2.2, r * 1.8, col, .22 * fade);                  // reflection on the wet road
+  }
+
+  // lightning lights everything up for a moment
+  if (S.flash) {
+    const a = t - S.flash;
+    const f = a < 0 ? 0 : a < 90 ? 1 : a < 180 ? .2 : a < 260 ? .8 : Math.exp(-(a - 260) / 220) * .8;
+    if (f > .01) { b.globalAlpha = .45 * f; b.fillStyle = '#d8e0ff'; b.fillRect(0, 0, W, H); b.globalAlpha = 1; }
+    if (a > 2000) S.flash = null;
+  }
+
+  // fog, with clear trails wiped through it by running drops
+  if (S.fog) {
+    b.drawImage(S.fog, 0, 0);
+    for (const tr of S.trails) {
+      const age = (t - tr.t) / 40000;
+      b.globalAlpha = .6 * (1 - age);
+      b.drawImage(S.bg, tr.x, tr.y, tr.w, 1, tr.x, tr.y, tr.w, 1);
+    }
+    b.globalAlpha = 1;
+  }
+
+  if (S.smudges) b.drawImage(S.smudges, 0, 0);
+
+  // droplets: each a tiny lens, brighter than what's behind it
+  const RC = CFG.rain.colors, shadow = RC.shadow, hi = RC.highlight;
+  for (const d of S.drops) drawDrop(b, S, d.x, d.y, d.r, shadow, hi);
+  for (const rn of S.runners) {
+    drawDrop(b, S, rn.x, rn.y, rn.r, shadow, hi);
+    drawDrop(b, S, rn.x, rn.y - rn.r * .9, rn.r * .75, shadow, hi);   // a little tail on top
+  }
+
+  // candle glow on the glass, then the frame and the candle itself
+  if (S.candle) {
+    const C = S.candle, CC = CFG.candle.colors;
+    const fl = .8 + .1 * Math.sin(t * .011 + C.ph) + .1 * Math.sin(t * .027 + C.ph * 2);
+    bokeh(b, C.x, C.y - C.h, 60 * k, hexRgb(CC.glow), .16 * fl);
+  }
+  if (S.frame) b.drawImage(S.frame, 0, 0);
+  if (S.cat) drawCat(b, S, t);               // behind the candle and the clock on the sill
+  if (S.candle) drawCandle(b, S, t);
+  if (CFG.clock.show && S.clock.box) bokeh(b, S.clock.x, S.clock.y - 8 * k, 22 * k, hexRgb(CFG.clock.colors.glow), .1 * CFG.clock.glow);
+  drawClock(b, S.clock);
+}
+
+function drawDrop(b, S, x, y, r, shadow, hi) {
+  const rx = Math.round(x), ry = Math.round(y);
+  // a drop is a little lens: it gathers light from around it, so it's brighter than what's behind
+  const a = sample(S, x, y - r * 5), c = sample(S, x, y + r * 6), d = sample(S, x - r * 4, y);
+  const lit = [0, 1, 2].map(i => Math.min(255, Math.max(a[i], c[i], d[i]) * 1.9 + 22 + (i === 2 ? 8 : 0)));
+  if (r < 1.1) {
+    b.fillStyle = rgba(lit, .55); b.fillRect(rx, ry, 1, 1);
+    return;
+  }
+  const R = Math.round(r);
+  b.fillStyle = rgba(lit, .95);
+  for (let dy = -R; dy <= R; dy++) {
+    const hw = Math.round(Math.sqrt(Math.max(0, r * r - dy * dy)) - .25);
+    if (hw >= 0) b.fillRect(rx - hw, ry + dy, hw * 2 + 1, 1);
+  }
+  b.globalAlpha = .55; b.fillStyle = shadow;            // dark rim underneath
+  const bw = Math.max(1, Math.round(r * 1.1));
+  b.fillRect(rx - (bw >> 1), ry + R, bw, 1);
+  b.globalAlpha = .9; b.fillStyle = hi;                 // glint
+  b.fillRect(rx - Math.round(r * .4), ry - Math.round(r * .45), 1, 1);
+  b.globalAlpha = 1;
+}
+
+function drawCandle(b, S, t) {
+  const C = S.candle, CC = CFG.candle.colors, k = S.k;
+  const fl = .8 + .1 * Math.sin(t * .011 + C.ph) + .1 * Math.sin(t * .027 + C.ph * 2);
+  bokeh(b, C.x, C.y - C.h, 22 * k, hexRgb(CC.glow), .35 * fl);
+  b.fillStyle = CC.wax; b.fillRect(C.x - (C.w >> 1), C.y - C.h, C.w, C.h);
+  b.fillStyle = 'rgba(0,0,0,.18)'; b.fillRect(C.x + (C.w >> 1) - 1, C.y - C.h, 1, C.h);
+  b.fillStyle = '#2a2020'; b.fillRect(C.x, C.y - C.h - Math.round(k), 1, Math.max(1, Math.round(k)));
+  const fh = Math.round((3 + fl * 2) * k), sway = Math.round(Math.sin(t * .004 + C.ph) * .6 * k);
+  b.fillStyle = CC.flame;
+  b.fillRect(C.x - Math.floor(k * .5) + sway, C.y - C.h - fh - Math.round(k), Math.max(1, Math.round(k * 1.5)), fh);
+  b.fillStyle = '#ffffff'; b.fillRect(C.x, C.y - C.h - Math.round(k * 2), 1, Math.max(1, Math.round(k)));
+}
+
+/* ------------------------------------------------------------------
+ * Clock (settings in config.js under `clock`)
+ * ------------------------------------------------------------------ */
+const CLOCK_FONTS = {
+  pixel: { h: 7, g: {
+    '0': [' ### ', '#   #', '#  ##', '# # #', '##  #', '#   #', ' ### '],
+    '1': ['  #  ', ' ##  ', '  #  ', '  #  ', '  #  ', '  #  ', ' ### '],
+    '2': [' ### ', '#   #', '    #', '   # ', '  #  ', ' #   ', '#####'],
+    '3': ['#####', '   # ', '  #  ', '   # ', '    #', '#   #', ' ### '],
+    '4': ['   # ', '  ## ', ' # # ', '#  # ', '#####', '   # ', '   # '],
+    '5': ['#####', '#    ', '#### ', '    #', '    #', '#   #', ' ### '],
+    '6': ['  ## ', ' #   ', '#    ', '#### ', '#   #', '#   #', ' ### '],
+    '7': ['#####', '    #', '   # ', '  #  ', ' #   ', ' #   ', ' #   '],
+    '8': [' ### ', '#   #', '#   #', ' ### ', '#   #', '#   #', ' ### '],
+    '9': [' ### ', '#   #', '#   #', ' ####', '    #', '   # ', ' ##  '],
+    ':': [' ', ' ', '#', ' ', '#', ' ', ' '],
+  } },
+  small: { h: 5, g: {
+    '0': ['###', '# #', '# #', '# #', '###'], '1': [' # ', '## ', ' # ', ' # ', '###'],
+    '2': ['###', '  #', '###', '#  ', '###'], '3': ['###', '  #', '###', '  #', '###'],
+    '4': ['# #', '# #', '###', '  #', '  #'], '5': ['###', '#  ', '###', '  #', '###'],
+    '6': ['###', '#  ', '###', '# #', '###'], '7': ['###', '  #', '  #', '  #', '  #'],
+    '8': ['###', '# #', '###', '# #', '###'], '9': ['###', '# #', '###', '  #', '###'],
+    ':': [' ', '#', ' ', '#', ' '],
+    'A': ['###', '# #', '###', '# #', '# #'], 'P': ['###', '# #', '###', '#  ', '#  '], 'M': ['# #', '###', '###', '# #', '# #'],
+  } },
+};
+// LED digits: which segments each digit lights, and the cells of each segment in a 4×7 box
+const CLOCK_DIGITS = ['abcdef', 'bc', 'abged', 'abgcd', 'fgbc', 'afgcd', 'afgedc', 'abc', 'abcdefg', 'abcdfg'];
+const CLOCK_SEGMENTS = { a: [[1, 0], [2, 0]], b: [[3, 1], [3, 2]], c: [[3, 4], [3, 5]], d: [[1, 6], [2, 6]],
+  e: [[0, 4], [0, 5]], f: [[0, 1], [0, 2]], g: [[1, 3], [2, 3]] };
+
+// The current time as lists of lit (and, for LED digits, unlit) cells in font pixels
+function clockLayout(now) {
+  const C = CFG.clock, pad = n => String(n).padStart(2, '0');
+  let h = now.getHours(), suffix = '';
+  if (C.hour12) { suffix = h < 12 ? 'AM' : 'PM'; h = h % 12 || 12; }
+  const txt = (C.hour12 ? String(h) : pad(h)) + ':' + pad(now.getMinutes()) + (C.seconds ? ':' + pad(now.getSeconds()) : '');
+  const colonOn = !C.blinkColon || now.getMilliseconds() < 500;
+  const seg = C.font === 'segment', F = CLOCK_FONTS[C.font] || CLOCK_FONTS.pixel, fh = seg ? 7 : F.h;
+  const on = [], off = [];
+  const put = (rows, x0, y0, list) => rows.forEach((row, y) => {
+    for (let i = 0; i < row.length; i++) if (row[i] === '#') list.push([x0 + i, y0 + y]);
+  });
+  let x = 0;
+  for (const ch of txt) {
+    if (ch === ':') { put(seg ? CLOCK_FONTS.pixel.g[':'] : F.g[':'], x, 0, colonOn ? on : off); x += 2; }
+    else if (seg) {
+      const lit = CLOCK_DIGITS[+ch];
+      for (const [s, cells] of Object.entries(CLOCK_SEGMENTS)) for (const [cx, cy] of cells) (lit.includes(s) ? on : off).push([x + cx, cy]);
+      x += 5;
+    } else { put(F.g[ch], x, 0, on); x += F.g[ch][0].length + 1; }
+  }
+  if (suffix) {
+    const S = CLOCK_FONTS.small;
+    x += 1;
+    for (const ch of suffix) { put(S.g[ch], x, fh - S.h, on); x += 4; }
+  }
+  return { on, off, w: x - 1, h: fh };
+}
+
+// anchor: { x, y, align: 'left' | 'center' | 'right', valign: 'top' | 'bottom', scale, box } in art pixels;
+// unit = screen pixels per art pixel (1 when drawing into the art-sized buffer)
+function drawClock(g, anchor, unit = 1) {
+  const C = CFG.clock;
+  if (!C.show || !anchor) return;
+  const now = new Date(), L = clockLayout(now);
+  const s = Math.max(1, Math.round(C.size * (anchor.scale || 1)));
+  const w = L.w * s, h = L.h * s;
+  let x = anchor.align === 'right' ? anchor.x - w : anchor.align === 'center' ? anchor.x - Math.round(w / 2) : anchor.x;
+  let y = anchor.valign === 'bottom' ? anchor.y - h : anchor.y;
+  if (C.drift && !anchor.box) {              // wander a pixel or two each minute so it can't burn into the screen
+    const m = now.getHours() * 60 + now.getMinutes();
+    x += Math.round(Math.sin(m * .7) * 2 * s); y += Math.round(Math.cos(m * .45) * 1.5 * s);
+  }
+  const rect = (px, py, rw, rh) => g.fillRect((x + px) * unit, (y + py) * unit, rw * unit, rh * unit);
+  if (anchor.box) {                          // a little bedside-clock case
+    const p = 2 * s;
+    g.fillStyle = C.colors.box; rect(-p, -p, w + p * 2, h + p * 2);
+    g.fillStyle = 'rgba(255,255,255,.1)'; rect(-p, -p, w + p * 2, 1);
+    g.fillStyle = 'rgba(0,0,0,.45)'; rect(-p, h + p - 1, w + p * 2, 1);
+  }
+  if (C.glow > 0) {
+    g.globalAlpha = .16 * C.glow; g.fillStyle = C.colors.glow;
+    for (const [px, py] of L.on) rect(px * s - s, py * s - s, s * 3, s * 3);
+  }
+  g.fillStyle = C.colors.text;
+  if (L.off.length) { g.globalAlpha = .1; for (const [px, py] of L.off) rect(px * s, py * s, s, s); }
+  g.globalAlpha = 1;
+  for (const [px, py] of L.on) rect(px * s, py * s, s, s);
+}
+
+// A fixed clock position: a corner or the middle of the top or bottom edge
+function clockCorner(pos, W, H, margin) {
+  const top = !pos.startsWith('bottom');
+  const align = pos.endsWith('left') ? 'left' : pos.endsWith('right') ? 'right' : 'center';
+  return { x: align === 'left' ? margin : align === 'right' ? W - margin : Math.round(W / 2),
+    y: top ? margin : H - margin, align, valign: top ? 'top' : 'bottom' };
+}
+// The scene's own spot when position is 'auto', otherwise the chosen corner
+function clockAnchor(auto, W, H, k) {
+  const pos = CFG.clock.position;
+  const a = pos === 'auto' ? auto : clockCorner(pos, W, H, Math.round(8 * k));
+  return { ...a, scale: k, box: pos === 'auto' && auto.box };
+}
+
+/* ------------------------------------------------------------------
+ * App: sizing, seed, resize, input
+ * ------------------------------------------------------------------ */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const buf = makeCanvas(1, 1), bctx = buf.getContext('2d', { willReadFrequently: true });
+let seed = parseSeed(), scene = null, lastTick = 0;
+
+function parseSeed() {
+  if (Number.isFinite(CFG.display.seed)) return CFG.display.seed >>> 0;
+  const n = parseInt(location.hash.slice(1), 10);
+  return Number.isFinite(n) ? n >>> 0 : (Math.random() * 2 ** 32) >>> 0;
+}
+
+function setup() {
+  const dpr = window.devicePixelRatio || 1;
+  const cw = Math.max(1, Math.floor(innerWidth * dpr)), ch = Math.max(1, Math.floor(innerHeight * dpr));
+  canvas.width = cw; canvas.height = ch;
+  const px = Math.max(1, Math.round(Math.min(cw, ch) / CFG.display.targetRows));
+  const W = Math.ceil(cw / px), H = Math.ceil(ch / px);
+  buf.width = W; buf.height = H;
+  scene = generateScene(seed, W, H);
+  scene.px = px;
+  const now = performance.now();
+  scene.lastRoll.car = scene.lastRoll.flash = scene.lastRoll.cat = lastTick = now;
+  for (let i = 0; i < 2; i++) dropRuns(scene, now - i * 2000);
+  history.replaceState(null, '', '#' + seed);
+  draw(now);
+}
+
+function rainNow(S, t) {
+  const R = CFG.rain;
+  return R.intensity * (R.lightest + (1 - R.lightest) * (.5 + .5 * Math.sin(TAU * t / (Math.max(.1, R.heavyMinutes) * 60000) + S.heavyPh)));
+}
+
+function dropRuns(S, t) {
+  const g = S.glass;
+  startRunner(S, g.x0 + Math.random() * (g.x1 - g.x0), g.y0 + Math.random() * (g.y1 - g.y0) * .5, (2.4 + Math.random()) * S.k, t);
+  S.runners.at(-1) && (S.runners.at(-1).pauseUntil = t);
+}
+
+/* ------------------------------------------------------------------
+ * A rare visitor: a cat jumps up onto the sill, sits watching the rain, then jumps down again
+ * ------------------------------------------------------------------ */
+const CAT_JUMP_MS = 650;
+
+function spawnCat(S, t) {
+  if (S.cat || !CFG.frame.show) return;
+  const C = CFG.cat, h = Math.round((S.glass.y1 - S.glass.y0) * C.size);
+  // a spot on the sill clear of the candle and the clock
+  const busy = [S.candle && S.candle.x, S.clock && S.clock.box ? S.clock.x : null].filter(v => v != null);
+  let x = S.W / 2;
+  for (let i = 0; i < 40; i++) {
+    const cx = S.W * (.18 + Math.random() * .64);
+    if (busy.every(v => Math.abs(v - cx) > h * .55 + 12 * S.k)) { x = cx; break; }
+  }
+  const coat = hexRgb(C.colors.coats[Math.floor(Math.random() * C.colors.coats.length)]).map(v => v * .65);
+  S.cat = { x: Math.round(x), h, coat, t0: t, state: 'up', ph: Math.random() * TAU, tailSide: Math.random() < .5 ? 1 : -1,
+    sitMs: (C.sitSeconds[0] + Math.random() * (C.sitSeconds[1] - C.sitSeconds[0])) * 1000 };
+}
+
+function stepCat(S, t) {
+  const c = S.cat, age = t - c.t0;
+  if (c.state === 'up' && age > CAT_JUMP_MS) { c.state = 'sit'; c.t0 = t; }
+  else if (c.state === 'sit' && age > c.sitMs) { c.state = 'down'; c.t0 = t; }
+  else if (c.state === 'down' && age > CAT_JUMP_MS) S.cat = null;
+}
+
+// A sitting cat seen from behind, as a pixel mask: body, shoulders, head, ears and tail
+function drawCat(b, S, t) {
+  const c = S.cat, h = c.h, feet = S.glass.y1 + Math.round(2 * S.k), age = t - c.t0;
+  // jumping: rises from below the bottom of the screen in an arc, or drops back down
+  let lift = 0;
+  if (c.state !== 'sit') {
+    const p = Math.min(1, age / CAT_JUMP_MS), q = c.state === 'up' ? 1 - p : p;
+    lift = -(S.H - feet + h) * q * q + Math.sin(q * Math.PI) * h * .25;
+  }
+  const by = feet - lift;                                   // bottom of the cat
+  // little movements while it sits: looking about, an ear twitch, the tail tip flicking
+  const look = Math.round(Math.sin(t * .0005 + c.ph) * Math.max(0, Math.sin(t * .00023 + c.ph * 2)) * h * .05);
+  const twitch = Math.sin(t * .0031 + c.ph) > .97 ? 1 : 0;
+  const flick = Math.sin(t * .0021 + c.ph) * Math.sin(t * .0006);
+  const inEll = (x, y, cx, cy, rx, ry) => ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1;
+  const inTri = (x, y, ax, ay, bx, by2, cx, cy) => {
+    const d = (bx - ax) * (cy - ay) - (by2 - ay) * (cx - ax);
+    const s1 = ((bx - ax) * (y - ay) - (by2 - ay) * (x - ax)) / d, s2 = ((x - ax) * (cy - ay) - (y - ay) * (cx - ax)) / d;
+    return s1 >= 0 && s2 >= 0 && s1 + s2 <= 1;
+  };
+  const headX = look, headY = -h * .78;
+  const inside = (x, y) =>                                  // x, y relative to the cat's bottom centre (y up is negative)
+    inEll(x, y, 0, -h * .27, h * .3, h * .28) ||                                   // haunches
+    (y > -h * .3 && y <= 0 && Math.abs(x) <= h * .28 - Math.max(0, y + h * .04) * 1.2) || // flat bottom on the sill
+    inEll(x, y, 0, -h * .52, h * .2, h * .2) ||                                     // back and shoulders
+    inEll(x, y, headX, headY, h * .155, h * .14) ||                                 // head
+    inTri(x, y, headX - h * .15, headY - h * .04, headX - h * .04, headY - h * .12, headX - h * (.13 + .02 * twitch), headY - h * .25) ||
+    inTri(x, y, headX + h * .15, headY - h * .04, headX + h * .04, headY - h * .12, headX + h * .13, headY - h * .25);
+  // the tail lies along the sill, its tip curling up and flicking
+  const tail = [];
+  const ts = c.tailSide, tw = Math.max(1.5, h * .05);
+  for (let i = 0; i <= 24; i++) {
+    const u = i / 24;
+    const tx = ts * (h * .22 + u * h * .42);
+    const ty = -tw * .8 - (u > .6 ? (u - .6) / .4 * h * (.12 + .1 * flick) : 0);
+    tail.push([tx, ty]);
+  }
+  const inTail = (x, y) => tail.some(([tx, ty]) => (x - tx) ** 2 + (y - ty) ** 2 <= tw * tw);
+
+  const x0 = Math.floor(-h * .4), x1 = Math.ceil(h * .75), y0 = Math.floor(-h * 1.05);
+  const coat = rgba(c.coat, 1);
+  const rimSide = S.candle ? Math.sign(S.candle.x - c.x) : 0;  // candlelight catches this edge
+  const rimCol = rgba(hexRgb(CFG.candle.colors.glow), .6), topCol = rgba(c.coat.map(v => Math.min(255, v * 1.4 + 25)), 1);
+  for (let y = y0; y <= 0; y++) {
+    let lo = Infinity, hi = -Infinity;
+    for (let x = x0; x <= x1; x++) {
+      if (!(inside(x, y) || inTail(x, y))) continue;
+      const sx = c.x + x, sy = Math.round(by + y);
+      b.fillStyle = !(inside(x, y - 1) || inTail(x, y - 1)) ? topCol : coat;   // a faint highlight along the top edges
+      b.fillRect(sx, sy, 1, 1);
+      lo = Math.min(lo, x); hi = Math.max(hi, x);
+    }
+    if (rimSide && hi >= lo) { b.fillStyle = rimCol; b.fillRect(c.x + (rimSide > 0 ? hi : lo), Math.round(by + y), 1, 1); }
+  }
+}
+
+// cars move at a steady speed in depth, so they creep along far away and rush past close up
+function addCar(S, t) {
+  const TC = CFG.traffic;
+  const weights = Object.entries(TC.types).filter(([n, w]) => w > 0 && CAR_TYPES[n]);
+  let pick = Math.random() * weights.reduce((a, [, w]) => a + w, 0), type = 'sedan';
+  for (const [n, w] of weights) { if ((pick -= w) < 0) { type = n; break; } }
+  // a colour from the list, nudged a little so no two cars match exactly, and darkened for night
+  const base = hexRgb(TC.colors.bodies[Math.floor(Math.random() * TC.colors.bodies.length)]);
+  const nudge = () => (Math.random() - .5) * 30, dim = 1 - TC.nightShade;
+  const body = base.map(v => clamp((v + nudge()) * dim, 0, 255));
+  S.cars.push({ coming: Math.random() < .5, t0: t, v: (1.6 + Math.random() * 1.2) / 1000 * (type === 'bus' ? .8 : 1), type, body });
+}
+
+// Front/back silhouettes, as fractions of the car's width
+const CAR_TYPES = {
+  sedan: { w: 1,    body: .34, cabBottom: .8,  cabTop: .56, cab: .25, round: .3 },
+  hatch: { w: .88,  body: .36, cabBottom: .82, cabTop: .62, cab: .31, round: .35 },
+  suv:   { w: 1.1,  body: .44, cabBottom: .9,  cabTop: .76, cab: .3,  round: .22 },
+  van:   { w: 1.06, body: .48, cabBottom: .94, cabTop: .86, cab: .44, round: .2 },
+  bus:   { w: 1.4,  body: .5,  cabBottom: .98, cabTop: .96, cab: .62, round: .12, sign: true },
+};
+
+// One car seen from the front or back, centred on (cx, lightsY) where its lights are
+function drawCarBody(b, T, rgb, cx, lightsY, bw) {
+  const bh = bw * T.body, top = lightsY - bh * .55, rad = bh * T.round * 1.4;
+  const cb = bw * T.cabBottom, ct = bw * T.cabTop, ch = bw * T.cab, cr = Math.min(ch * .45, ct * .3);
+  const cabin = (inset, h = 1) => {           // cabin: narrower at the roof, with rounded top corners
+    const bot = top + 1, tp = top - ch * h + inset, l0 = cx - cb / 2 + inset * 1.4, l1 = cx - ct / 2 + inset;
+    const r0 = cx + cb / 2 - inset * 1.4, r1 = cx + ct / 2 - inset, rr = Math.max(0, cr - inset);
+    b.beginPath(); b.moveTo(l0, bot); b.lineTo(l1, tp + rr); b.quadraticCurveTo(l1, tp, l1 + rr, tp);
+    b.lineTo(r1 - rr, tp); b.quadraticCurveTo(r1, tp, r1, tp + rr); b.lineTo(r0, bot); b.closePath(); b.fill();
+  };
+  // shadow on the road, body, cabin
+  b.fillStyle = 'rgba(0,0,0,.55)';
+  b.beginPath(); b.ellipse(cx, top + bh + bw * .02, bw * .5, Math.max(1, bh * .16), 0, 0, TAU); b.fill();
+  b.fillStyle = rgba(rgb, 1);
+  b.beginPath(); b.roundRect(cx - bw / 2, top, bw, bh, [rad, rad, rad * .5, rad * .5]); b.fill();
+  cabin(0);
+  // a lighter band along the top of the body where it catches the street lights
+  b.fillStyle = rgba(rgb.map(v => Math.min(255, v * 1.5 + 20)), .55);
+  b.beginPath(); b.roundRect(cx - bw * .46, top + bh * .06, bw * .92, Math.max(1, bh * .18), rad * .5); b.fill();
+  // windscreen / rear window, catching the city's glow
+  b.fillStyle = 'rgba(150,160,205,.32)'; cabin(Math.max(.6, ch * .14), .92);
+  // wing mirrors (not on the bus)
+  if (!T.sign) { b.fillStyle = rgba(rgb, 1); b.fillRect(cx - cb / 2 - bw * .05, top - ch * .28, bw * .06, Math.max(1, ch * .14)); b.fillRect(cx + cb / 2 - bw * .01, top - ch * .28, bw * .06, Math.max(1, ch * .14)); }
+  // the bus's lit destination sign
+  if (T.sign) { b.fillStyle = 'rgba(255,190,80,.85)'; b.fillRect(cx - ct * .35, top - ch + ch * .06, ct * .7, Math.max(1, ch * .1)); }
+}
+function carDepth(car, t) {
+  const d = car.v * (t - car.t0);
+  return car.coming ? ROAD_FAR - d : .6 + d;
+}
+
+function tick(S, t) {
+  const dt = Math.min(200, t - lastTick); lastTick = t;
+  const g = S.glass;
+  // rain landing on the glass
+  S.rainAcc += S.W * S.H / 2200 * rainNow(S, t) * dt / 1000;
+  while (S.rainAcc >= 1) {
+    S.rainAcc--;
+    addDrop(S, g.x0 + Math.random() * (g.x1 - g.x0), g.y0 + Math.random() * (g.y1 - g.y0), .4 + Math.random() ** 2.5 * 1.7, t);
+  }
+  stepRunners(S, t, dt);
+  S.cars = S.cars.filter(c => { const z = carDepth(c, t); return z > .55 && z < ROAD_FAR; });
+  if (t - S.lastRoll.car > CFG.traffic.everySeconds * 1000) {
+    S.lastRoll.car = t;
+    if (Math.random() < CFG.traffic.chance) addCar(S, t);
+  }
+  if (t - S.lastRoll.flash > CFG.lightning.everyMinutes * 60000) {
+    S.lastRoll.flash = t;
+    if (Math.random() < CFG.lightning.chance) S.flash = t;
+  }
+  if (t - S.lastRoll.cat > CFG.cat.everyMinutes * 60000) {
+    S.lastRoll.cat = t;
+    if (Math.random() < CFG.cat.chance) spawnCat(S, t);
+  }
+  if (S.cat) stepCat(S, t);
+}
+
+function draw(t) {
+  tick(scene, t);
+  render(bctx, scene, t);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(buf, 0, 0, scene.W * scene.px, scene.H * scene.px);
+}
+
+let lastDraw = -Infinity;
+function loop(t) {
+  requestAnimationFrame(loop);
+  if (FRAME_INTERVAL) {
+    if (t - lastDraw < FRAME_INTERVAL - 1.5) return;
+    lastDraw = Math.max(lastDraw + FRAME_INTERVAL, t - FRAME_INTERVAL);
+  }
+  draw(t);
+}
+
+function regenerate() { seed = (Math.random() * 2 ** 32) >>> 0; setup(); }
+
+let resizeTimer = 0;
+addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(setup, 100); });
+if (CFG.display.clickToRegenerate) canvas.addEventListener('click', regenerate);
+else canvas.style.cursor = 'default';
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase(), now = performance.now();
+  if (k === 'r' && CFG.display.clickToRegenerate) regenerate();
+  if (k === 'l') scene.flash = now;
+  if (k === 'c') addCar(scene, now);
+  if (k === 'd') dropRuns(scene, now);
+  // X = this scene's rare visitor (Shift+X = its variation, where it has one)
+  if (k === 'x') spawnCat(scene, now);
+  if (!CFG.display.animate) draw(now);
+});
+
+setup();
+if (CFG.display.animate) requestAnimationFrame(loop);
+
+window.rainy = { get scene() { return scene; }, draw, setup, regenerate, addCar, dropRuns, spawnCat };
+</script>
+</body>
+</html>

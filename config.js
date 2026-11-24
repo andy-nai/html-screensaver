@@ -13,7 +13,8 @@
 window.CITYSCAPE_CONFIG = {
 
   display: {
-    targetRows: 200,          // rough height of the scene in art pixels (lower = chunkier pixels)
+    targetRows: 200,          // art pixels across the screen's shorter side (lower = chunkier pixels);
+                              // a tall screen gets taller buildings, the street stays the same size
     animate: true,            // false = a still image
     seed: null,               // a number to always show the same city; null = random (or the #seed in the URL)
     clickToRegenerate: true,  // click / press R for a new city

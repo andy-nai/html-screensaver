@@ -206,14 +206,17 @@ const LAYERS = [
  * Scene generation (pure data — nothing drawn here)
  * ------------------------------------------------------------------ */
 function generateScene(seed, W, H) {
-  const s = H / 200;
-  const horizon = Math.round(H * 0.91);
+  // s = size scale for things that shouldn't grow on a tall screen (road,
+  // cars, people, lamps, moon…): based on the shorter side, ~1 normally.
+  // The street keeps a fixed height; any extra height goes to sky and skyline.
+  const s = Math.min(W, H) / 200;
+  const horizon = H - Math.round(18 * s);
   const scene = { seed, W, H, s, horizon, stars: [], moon: null, layers: [], lamps: [], meteors: [], cars: [], peds: [], ufo: null };
 
   // Moon
   {
     const rng = makeRng(subSeed(seed, 1));
-    const r = Math.max(5, Math.round(H * 0.045));
+    const r = Math.max(5, Math.round(9 * s));
     const moon = {
       x: Math.round(rng.range(.12, .88) * W),
       y: Math.round(rng.range(.1, .26) * H),
@@ -295,7 +298,7 @@ function generateScene(seed, W, H) {
     const dir = rng.chance(.5) ? 1 : -1; // a real street's lamps all face the same way
     while (x < W + 10) {
       scene.fgLamps.push({
-        x, top: Math.round(rng.range(.83, .84) * H),
+        x, top: H - Math.round(rng.range(32, 34) * s),
         dir, arm: 2,
       });
       x += Math.round(rng.int(...CFG.streetlights.foregroundSpacing) * s);
@@ -1517,7 +1520,9 @@ function setup() {
   const ch = Math.max(1, Math.floor(innerHeight * dpr));
   canvas.width = cw; canvas.height = ch;
 
-  const px = Math.max(1, Math.round(ch / TARGET_ROWS)); // size of one art pixel in device px
+  // size of one art pixel in device px, from the screen's shorter side, so a
+  // tall screen gets more sky and taller buildings rather than bigger pixels
+  const px = Math.max(1, Math.round(Math.min(cw, ch) / TARGET_ROWS));
   const W = Math.ceil(cw / px), H = Math.ceil(ch / px);
   backBuf.width = frontBuf.width = fgBuf.width = W;
   backBuf.height = frontBuf.height = fgBuf.height = H;

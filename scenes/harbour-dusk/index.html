@@ -1,0 +1,878 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harbour at Dusk</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #120f2a; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; image-rendering: pixelated; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<!-- optional user settings; the page falls back to the defaults below if it's missing -->
+<script>
+  document.write('<script src="config.js?v=' + Date.now() + '"><\/script>');
+</script>
+<script>
+'use strict';
+
+/* ------------------------------------------------------------------
+ * Config — defaults, overridden by config.js (window.HARBOUR_CONFIG)
+ * ------------------------------------------------------------------ */
+const DEFAULTS = {
+  display: { targetRows: 200, animate: true, frameRate: 24, seed: null, clickToRegenerate: true },
+  dusk: { cycleMinutes: 20, startAt: null },
+  sky: {
+    colors: {
+      dusk:  ['#2b2b5f', '#45397a', '#6e4886', '#a35a80', '#d6706f', '#f0955f', '#ffbf6e'],
+      night: ['#060a20', '#0a102b', '#0f1736', '#151f44', '#1d2a52', '#283660', '#35436c'],
+    },
+  },
+  sun: { colors: { disc: '#ffe7a6', setting: '#ff8a52', glow: '#ffb070' } },
+  stars: { count: 110, colors: ['#5a5f8f', '#9aa0cc', '#d8dcf6', '#ffffff'] },
+  water: {
+    tint: .6, rippleDensity: 1,
+    colors: {
+      dusk:  ['#b86a70', '#8a5272', '#5c3f6a', '#3a2f5a', '#221f44'],
+      night: ['#27345e', '#1d2850', '#151e42', '#0e1534', '#090e26'],
+      glint: { dusk: '#ffd2a0', night: '#7f8fc4' },
+    },
+  },
+  shore: {
+    lightsPerHundredPixels: 9,
+    colors: {
+      hills: { dusk: '#4e3463', night: '#111832' },
+      rocks: { dusk: '#2e2240', night: '#0b0f22' },
+      lights: ['#ffd27a', '#ffc35a', '#ffe7b0', '#ffb070', '#d8ecff'],
+    },
+  },
+  lighthouse: {
+    beamSeconds: 12,
+    colors: { white: '#e9ddcd', red: '#b2403c', roof: '#5a2230', lamp: '#fff3b8', beam: '#fff0c0' },
+  },
+  boats: {
+    moored: [3, 6], passingEverySeconds: 45, passingChance: .5,
+    colors: {
+      hulls: ['#e8e0d4', '#2f5a8a', '#a8423c', '#2e6a54', '#d8b25a', '#3a3a4a', '#f0f0f0'],
+      trim: ['#2a2a3a', '#c8c0b0', '#8a2a2a', '#244a7a'],
+      cabins: ['#e8e0d4', '#cfc6b6', '#f4efe6'],
+      sail: '#ece4d4', mast: '#8a7a6a', lights: '#ffd890',
+    },
+  },
+  gulls: { everySeconds: 20, chance: .5, colors: { body: '#2a2034' } },
+  whale: { everyMinutes: 12, chance: .3, colors: { body: '#2c2a3c', spout: '#e8eef8' } },
+  pier: { colors: { deck: '#6a4c3c', plank: '#563c30', post: '#33231e', lamp: '#ffd890' } },
+  nightTint: { color: '#0a1030', amount: .55 },
+  clock: { show: true, hour12: false, seconds: false, position: 'auto', font: 'pixel', size: 1,
+    blinkColon: false, drift: true, glow: 0.6, colors: { text: '#fff0d8', glow: '#ffb070', box: '#161214' } },
+};
+
+function mergeConfig(base, over, path = '') {
+  const out = { ...base };
+  for (const k of Object.keys(over || {})) {
+    const b = base[k], o = over[k], p = path ? `${path}.${k}` : k;
+    if (o === undefined) continue;
+    if (!(k in base)) { console.warn(`config.js: unknown setting "${p}" ignored`); continue; }
+    const isGroup = v => v && typeof v === 'object' && !Array.isArray(v);
+    out[k] = isGroup(b) && isGroup(o) ? mergeConfig(b, o, p) : o;
+  }
+  return out;
+}
+const CFG = mergeConfig(DEFAULTS, window.HARBOUR_CONFIG);
+const FRAME_INTERVAL = CFG.display.frameRate > 0 ? 1000 / CFG.display.frameRate : 0;
+
+/* ------------------------------------------------------------------
+ * Helpers: RNG, colour, dithering, noise
+ * ------------------------------------------------------------------ */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function makeRng(seed) {
+  const r = mulberry32(seed >>> 0);
+  return {
+    next: r,
+    range: (a, b) => a + r() * (b - a),
+    int: (a, b) => Math.floor(a + r() * (b - a + 1)),
+    pick: arr => arr[Math.floor(r() * arr.length)],
+    chance: p => r() < p,
+  };
+}
+const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const css = c => `rgb(${c[0] | 0},${c[1] | 0},${c[2] | 0})`;
+const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const mixHex = (a, b, t) => css(mix(hexRgb(a), hexRgb(b), t));
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + .5) / 16);
+const TAU = Math.PI * 2;
+
+function makeCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+
+// Fills rows y0..y1 of an ImageData with a dithered vertical gradient through `stops` (rgb arrays)
+function ditherRows(img, y0, y1, stops) {
+  const d = img.data, W = img.width, n = stops.length - 1, span = Math.max(1, y1 - y0 - 1);
+  for (let y = y0; y < y1; y++) {
+    const f = n ? (y - y0) / span * n : 0;
+    const i = Math.min(Math.max(n - 1, 0), Math.floor(f)), fr = f - i;
+    for (let x = 0; x < W; x++) {
+      const c = n && fr > BAYER[(y & 3) * 4 + (x & 3)] ? stops[i + 1] : stops[i];
+      const o = (y * W + x) * 4;
+      d[o] = c[0]; d[o + 1] = c[1]; d[o + 2] = c[2]; d[o + 3] = 255;
+    }
+  }
+}
+// The colour a dithered gradient through `stops` has at fraction f (0..1)
+function gradientAt(stops, f) {
+  const n = stops.length - 1, x = clamp(f, 0, 1) * n, i = Math.min(n - 1, Math.floor(x));
+  return n ? mix(stops[i], stops[i + 1], x - i) : stops[0];
+}
+
+// smooth 1-D value noise, 0..1
+function makeNoise(rng) {
+  const v = Array.from({ length: 256 }, () => rng.next());
+  const at = x => {
+    const i = Math.floor(x), f = x - i, s = (1 - Math.cos(f * Math.PI)) / 2;
+    return v[i & 255] * (1 - s) + v[(i + 1) & 255] * s;
+  };
+  return (x, oct = 3) => {
+    let sum = 0, amp = 1, tot = 0;
+    for (let o = 0; o < oct; o++) { sum += at(x * 2 ** o + o * 37) * amp; tot += amp; amp /= 2; }
+    return sum / tot;
+  };
+}
+
+// A copy of `src` darkened towards the night tint
+function nightCopy(src) {
+  const c = makeCanvas(src.width, src.height), x = c.getContext('2d');
+  x.drawImage(src, 0, 0);
+  x.globalCompositeOperation = 'source-atop';
+  x.globalAlpha = CFG.nightTint.amount;
+  x.fillStyle = CFG.nightTint.color;
+  x.fillRect(0, 0, c.width, c.height);
+  return c;
+}
+
+function glow(b, x, y, r, color, alpha) {
+  if (alpha <= 0.01 || r <= 0) return;
+  const g = b.createRadialGradient(x + .5, y + .5, 0, x + .5, y + .5, r);
+  g.addColorStop(0, color); g.addColorStop(1, 'rgba(0,0,0,0)');
+  b.globalAlpha = alpha; b.fillStyle = g;
+  b.fillRect(x - r, y - r, r * 2 + 1, r * 2 + 1);
+  b.globalAlpha = 1;
+}
+
+/* ------------------------------------------------------------------
+ * Scene generation
+ * ------------------------------------------------------------------ */
+function generateScene(seed, W, H) {
+  const rng = makeRng(seed), noise = makeNoise(rng);
+  const k = H / 200;                       // size scale relative to the default 200 rows
+  const S = { seed, W, H, k, rng, boats: [], passing: [], gulls: [], whale: null, lastRoll: { boat: 0, gull: 0, whale: 0 } };
+  S.horizon = Math.round(H * .5);
+  const hz = S.horizon;
+
+  // where we are in the dusk cycle: darkness d(t) = .5 - .5cos(2π(t + tOff) / cycle)
+  S.cycle = Math.max(1, CFG.dusk.cycleMinutes) * 60000;
+  const start = Number.isFinite(CFG.dusk.startAt) ? clamp(CFG.dusk.startAt, 0, 1) : rng.range(0, .7);
+  S.tOff = Math.acos(1 - 2 * start) / TAU * S.cycle - performance.now();
+
+  const lhLeft = rng.chance(.5);
+  const edgeX = u => lhLeft ? u : W - 1 - u;          // distance from the lighthouse's edge → x
+  const pierX = u => lhLeft ? W - 1 - u : u;          // distance from the pier's edge → x
+
+  S.sunX = Math.round(W * (lhLeft ? rng.range(.45, .7) : rng.range(.3, .55)));
+  S.sunR = Math.max(4, Math.round(8 * k));
+
+  // stars: each appears once it's dark enough
+  S.stars = Array.from({ length: Math.round(CFG.stars.count * W / 356) }, () => ({
+    x: rng.int(0, W - 1), y: Math.floor(hz * rng.next() ** 1.4 * .85),
+    th: rng.range(.3, .9), c: rng.int(0, CFG.stars.colors.length - 1),
+    sp: rng.range(.0006, .002), ph: rng.range(0, TAU),
+  }));
+
+  // scenery that sits on the horizon (reflected in the water): far hills, headland, lighthouse
+  const scen = makeCanvas(W, H), s = scen.getContext('2d');
+  const hillsCol = CFG.shore.colors.hills, rocksCol = CFG.shore.colors.rocks;
+  s.fillStyle = hillsCol.dusk;
+  const hillH = x => Math.round((1.5 + noise(x * .015 + 3, 4) * H * .07) * (.6 + .4 * noise(x * .004 + 9, 2)));
+  for (let x = 0; x < W; x++) s.fillRect(x, hz - hillH(x), 1, hillH(x));
+
+  // town lights on the far shore
+  S.townLights = [];
+  const nLights = Math.round(W / 100 * CFG.shore.lightsPerHundredPixels);
+  for (let i = 0; i < nLights; i++) {
+    const x = rng.int(0, W - 1), h = hillH(x);
+    if (h < 3) continue;
+    S.townLights.push({ x, y: hz - rng.int(1, Math.max(1, Math.round(h * .5))),
+      c: rng.pick(CFG.shore.colors.lights), th: rng.range(.12, .8), ph: rng.range(0, TAU) });
+  }
+
+  // headland: high at the edge, sloping down to a rocky tip
+  const hw = Math.round(W * rng.range(.17, .26)), hTop = H * rng.range(.07, .1);
+  const headH = u => u >= hw ? 0 : Math.max(0, Math.round(hTop * (1 - (u / hw) ** 2.2) + (noise(u * .2 + 50, 2) - .5) * 4 * k));
+  S.headland = { hw, lhLeft };
+  for (let u = 0; u < hw; u++) {
+    const h = headH(u), x = edgeX(u);
+    if (!h) continue;
+    s.fillStyle = rocksCol.dusk; s.fillRect(x, hz - h, 1, h + 1);
+    s.fillStyle = mixHex(rocksCol.dusk, CFG.sky.colors.dusk.at(-1), .25);
+    s.fillRect(x, hz - h, 1, 1);                       // lit top edge
+  }
+
+  // lighthouse
+  const lu = Math.round(hw * rng.range(.42, .55)), lx = edgeX(lu), baseY = hz - headH(lu);
+  const th = Math.round(H * .15), bw = Math.max(5, Math.round(7 * k) | 1);
+  const LC = CFG.lighthouse.colors, band = Math.max(2, Math.round(th / 6));
+  for (let i = 0; i < th; i++) {
+    const y = baseY - i, w = Math.round(bw - (bw - (bw - 2)) * i / th) | 1;
+    const red = Math.floor(i / band) % 2 === 1;
+    s.fillStyle = red ? LC.red : LC.white;
+    s.fillRect(lx - (w >> 1), y, w, 1);
+    s.fillStyle = 'rgba(0,0,0,.22)';                    // shaded side
+    s.fillRect(lx + (w >> 1) - Math.max(1, Math.round(w / 4)) + (lhLeft ? 0 : 0), y, Math.max(1, Math.round(w / 4)), 1);
+  }
+  const topY = baseY - th, tw = bw - 2;
+  s.fillStyle = '#2a2230'; s.fillRect(lx - (tw >> 1) - 1, topY, tw + 2, 1);           // gallery
+  const lampH = Math.max(2, Math.round(3 * k));
+  s.fillStyle = '#3a3448'; s.fillRect(lx - (tw >> 1), topY - lampH, tw, lampH);      // lamp room
+  for (let i = 0; i < 3; i++) { s.fillStyle = LC.roof; s.fillRect(lx - (tw >> 1) + i, topY - lampH - 1 - i, tw - i * 2, 1); }
+  s.fillRect(lx, topY - lampH - 4, 1, 1);
+  S.lamp = { x: lx, y: topY - Math.ceil(lampH / 2), w: tw, h: lampH, top: topY - lampH };
+  S.beamMs = Math.max(1, CFG.lighthouse.beamSeconds) * 1000;
+  S.beamPh = rng.range(0, TAU);
+
+  // keeper's cottage on the landward side
+  const cu = Math.max(2, lu - Math.round(10 * k)), cx = edgeX(cu), cy = hz - headH(cu);
+  const cw = Math.round(9 * k), ch = Math.round(5 * k), cl = lhLeft ? cx - cw + 1 : cx;
+  s.fillStyle = '#cfc2b2'; s.fillRect(cl, cy - ch, cw, ch + 1);
+  s.fillStyle = '#6a3a3a';
+  for (let i = 0; i < Math.ceil(cw / 2) + 1; i++) s.fillRect(cl - 1 + i, cy - ch - 1 - i, cw + 2 - i * 2, 1);
+  S.cottageWin = { x: cl + Math.round(cw * .3), y: cy - Math.round(ch * .6), w: Math.max(1, Math.round(2 * k)), h: Math.max(1, Math.round(2 * k)) };
+
+  S.scenDay = scen; S.scenNight = nightCopy(scen);
+
+  // pier, in the foreground on the other side
+  const pier = makeCanvas(W, H), p = pier.getContext('2d'), PC = CFG.pier.colors;
+  const pw = Math.round(W * rng.range(.2, .3)), deckY = H - Math.round(H * rng.range(.15, .19));
+  const postGap = Math.max(6, Math.round(9 * k)), postW = Math.max(2, Math.round(2 * k));
+  for (let u = 2; u < pw; u += postGap) {
+    p.fillStyle = PC.post; p.fillRect(pierX(u) - (lhLeft ? postW - 1 : 0), deckY, postW, H - deckY);
+  }
+  const deckH = Math.max(3, Math.round(3 * k));
+  for (let u = 0; u < pw; u++) {
+    const x = pierX(u);
+    p.fillStyle = PC.deck; p.fillRect(x, deckY - deckH, 1, deckH);
+    p.fillStyle = PC.plank; p.fillRect(x, deckY - 1, 1, 1);
+    if (u % 4 === 0) p.fillRect(x, deckY - deckH, 1, deckH - 1);
+  }
+  // railing
+  const railH = Math.round(5 * k);
+  p.fillStyle = PC.post;
+  for (let u = 1; u < pw - 1; u += postGap) p.fillRect(pierX(u), deckY - deckH - railH, 1, railH);
+  for (let u = 0; u < pw - 1; u++) p.fillRect(pierX(u), deckY - deckH - railH, 1, 1);
+  // a few crates and a bollard
+  for (let i = rng.int(1, 3); i > 0; i--) {
+    const u = rng.int(3, pw - 10), sz = Math.round(rng.range(3, 5) * k);
+    p.fillStyle = '#7a5a3a'; p.fillRect(pierX(u), deckY - deckH - sz, sz, sz);
+    p.fillStyle = '#5a3e28'; p.fillRect(pierX(u), deckY - deckH - sz, sz, 1);
+  }
+  // lamp post near the end
+  const lpU = pw - Math.round(4 * k), lpX = pierX(lpU), poleH = Math.round(20 * k);
+  p.fillStyle = '#2a2228'; p.fillRect(lpX, deckY - deckH - poleH, 1, poleH);
+  p.fillRect(lpX - 1, deckY - deckH - poleH - 1, 3, 2);
+  S.pierLamp = { x: lpX, y: deckY - deckH - poleH + 1, th: rng.range(.25, .4) };
+  S.pier = { deckY, pw, lhLeft };
+  S.pierDay = pier; S.pierNight = nightCopy(pier);
+
+  // ripples (glints) on the water
+  const nRip = Math.round(W * (H - hz) / 32 * CFG.water.rippleDensity);
+  S.ripples = Array.from({ length: nRip }, () => {
+    const y = hz + 1 + Math.floor((H - hz - 1) * rng.next() ** 1.15);
+    const d = (y - hz) / (H - hz);
+    return { x: rng.int(0, W - 1), y, len: 1 + Math.round(d * rng.range(1, 5) * k),
+      sp: rng.range(.0007, .0018), ph: rng.range(0, TAU) };
+  });
+
+  // moored boats between the headland and the pier
+  const [bmin, bmax] = CFG.boats.moored;
+  const open0 = lhLeft ? hw * .8 : pw + 4, open1 = lhLeft ? W - pw - 4 : W - hw * .8;
+  S.openX = [open0, open1];
+  const n = rng.int(bmin, bmax);
+  for (let i = 0; i < n; i++) {
+    const y = Math.round(hz + 8 * k + rng.next() ** .8 * (deckY - hz - 14 * k));
+    const d = (y - hz) / (H - hz);
+    const L = Math.round((8 + d * 30) * k);
+    const x = Math.round(rng.range(open0, Math.max(open0 + 1, open1 - L)));
+    S.boats.push(makeBoat(rng, x, y, L, rng.chance(.6) ? 'sail' : 'fishing', rng.chance(.5)));
+  }
+  // and one tied up at the pier
+  if (rng.chance(.7)) {
+    const L = Math.round(rng.range(16, 22) * k);
+    const x = lhLeft ? W - pw - L - 2 : pw + 2;
+    S.boats.push(makeBoat(rng, x, deckY + Math.round(6 * k), L, 'row', lhLeft));
+  }
+  S.boats.sort((a, b) => a.y - b.y);
+
+  // per-frame buffers
+  S.skyCan = makeCanvas(W, hz); S.waterCan = makeCanvas(W, H - hz);
+  S.mirror = makeCanvas(W, hz);
+  S.lastSkyDark = -1;
+  // clock in the top corner away from the lighthouse
+  const cm = Math.round(8 * k);
+  S.clock = clockAnchor({ x: lhLeft ? W - cm : cm, y: cm, align: lhLeft ? 'right' : 'left', valign: 'top' }, W, H, k);
+  return S;
+}
+
+// Builds a boat sprite (bottom row = waterline) plus its night version and light positions
+function makeBoat(rng, x, y, L, type, faceLeft) {
+  const k = 1, C = CFG.boats.colors;
+  const hullH = Math.max(2, Math.round(L * .2));
+  const mastH = type === 'sail' ? Math.round(L * 1.15) : type === 'fishing' ? Math.round(L * .75) : 0;
+  const cabH = type === 'fishing' ? Math.max(2, Math.round(L * .28)) : type === 'sail' ? Math.max(1, Math.round(L * .12)) : 0;
+  const h = hullH + Math.max(mastH, cabH) + 1, w = L + 2;
+  const c = makeCanvas(w, h), g = c.getContext('2d');
+  const hull = rng.pick(C.hulls), trim = rng.pick(C.trim), cabin = rng.pick(C.cabins);
+  const lights = [];
+  // hull: rows narrow towards the keel, the bow (right) more than the stern
+  for (let r = 0; r < hullH; r++) {
+    const f = r / hullH, bow = Math.round(f * L * .25 + (r === 0 ? 0 : 1)), stern = Math.round(f * L * .08);
+    g.fillStyle = r === 0 ? trim : hull;
+    g.fillRect(1 + stern, h - hullH + r, L - stern - bow, 1);
+  }
+  g.fillStyle = 'rgba(0,0,0,.25)'; g.fillRect(1, h - 1, L, 1);
+  const deck = h - hullH;
+  if (type === 'sail') {
+    const mx = 1 + Math.round(L * .42);
+    g.fillStyle = cabin; g.fillRect(1 + Math.round(L * .22), deck - cabH, Math.round(L * .3), cabH);
+    g.fillStyle = C.mast; g.fillRect(mx, deck - mastH, 1, mastH);
+    g.fillRect(1 + Math.round(L * .12), deck - Math.max(2, Math.round(L * .16)), mx - Math.round(L * .12), 1); // boom
+    g.fillStyle = C.sail;                                                                                     // furled sail
+    g.fillRect(1 + Math.round(L * .16), deck - Math.max(3, Math.round(L * .16)) , mx - Math.round(L * .16), 1);
+    g.fillStyle = 'rgba(80,70,60,.7)';                                                                         // forestay
+    for (let i = 0; i < mastH; i++) {
+      const fx = mx + Math.round(i / mastH * (L * .5));
+      if (fx < w - 1) g.fillRect(fx, deck - mastH + i, 1, 1);
+    }
+    lights.push({ x: mx, y: deck - mastH, c: '#ffffff', th: rng.range(.35, .6) });
+    if (cabH > 1) lights.push({ x: 1 + Math.round(L * .3), y: deck - cabH + 1 - 1 + 1, c: C.lights, th: rng.range(.45, .85), w: Math.max(1, Math.round(L * .1)) });
+  } else if (type === 'fishing') {
+    const cx0 = 1 + Math.round(L * .15), cw = Math.round(L * .32);
+    g.fillStyle = cabin; g.fillRect(cx0, deck - cabH, cw, cabH);
+    g.fillStyle = trim; g.fillRect(cx0 - 1, deck - cabH - 1, cw + 2, 1);
+    g.fillStyle = '#2a3040'; g.fillRect(cx0 + 1, deck - cabH + 1, cw - 2, Math.max(1, Math.round(cabH * .35)));
+    g.fillStyle = C.mast; g.fillRect(1 + Math.round(L * .62), deck - mastH, 1, mastH);
+    g.fillRect(1 + Math.round(L * .62) - Math.round(L * .12), deck - Math.round(mastH * .7), Math.round(L * .24), 1);
+    lights.push({ x: 1 + Math.round(L * .62), y: deck - mastH, c: '#ffffff', th: rng.range(.3, .55) });
+    lights.push({ x: cx0 + 1, y: deck - cabH + 1, c: C.lights, th: rng.range(.35, .7), w: cw - 2 });
+  } else {
+    g.fillStyle = '#4a3a30'; g.fillRect(1 + Math.round(L * .35), deck - 1, Math.max(1, Math.round(L * .08)), 1); // oar seat
+  }
+  let day = c;
+  if (faceLeft) {                                         // mirror so the bow points left
+    const f = makeCanvas(w, h), fg = f.getContext('2d');
+    fg.translate(w, 0); fg.scale(-1, 1); fg.drawImage(c, 0, 0);
+    day = f;
+    for (const l of lights) l.x = w - 1 - l.x - ((l.w || 1) - 1);
+  }
+  return { x, y, w, h, day, night: nightCopy(day), lights,
+    bobMs: rng.range(3500, 6000), ph: rng.range(0, TAU), amp: L > 14 ? 1 : 1 };
+}
+
+/* ------------------------------------------------------------------
+ * Things that come and go
+ * ------------------------------------------------------------------ */
+function spawnPassingBoat(S, t) {
+  const rng = makeRng((Math.random() * 2 ** 32) >>> 0);
+  const L = Math.round(rng.range(8, 12) * S.k), y = S.horizon + Math.round(rng.range(3, 10) * S.k);
+  const right = rng.chance(.5);
+  const b = makeBoat(rng, 0, y, L, 'fishing', !right);
+  b.vx = (right ? 1 : -1) * rng.range(2, 3.5) * S.k / 1000;
+  b.x0 = right ? -b.w - 2 : S.W + 2; b.t0 = t; b.x = b.x0;
+  b.lights.forEach(l => l.th = .2);
+  S.passing.push(b);
+}
+
+function spawnGulls(S, t) {
+  const n = 1 + Math.floor(Math.random() * 4), right = Math.random() < .5;
+  const y = S.horizon * (.15 + Math.random() * .45), v = (8 + Math.random() * 6) * S.k / 1000 * (right ? 1 : -1);
+  for (let i = 0; i < n; i++) {
+    S.gulls.push({ x0: right ? -6 - i * 7 : S.W + 6 + i * 7, y: y + (Math.random() - .5) * 10 * S.k,
+      vx: v * (.9 + Math.random() * .2), t0: t, flapMs: 380 + Math.random() * 220, ph: Math.random() * 4,
+      bobPh: Math.random() * TAU });
+  }
+}
+
+// A rare visitor: a whale far out in the bay spouts, shows its back, then lifts its tail and dives
+const WHALE_MS = 15000;
+function spawnWhale(S, t) {
+  if (S.whale) return;
+  const [a, b] = S.openX, dir = Math.random() < .5 ? 1 : -1;
+  S.whale = { x: a + (b - a) * (.25 + Math.random() * .5), y: S.horizon + Math.round((5 + Math.random() * 7) * S.k), dir, t0: t };
+}
+
+function drawWhale(b, S, t, dark) {
+  const wh = S.whale, a = t - wh.t0, k = S.k;
+  if (a > WHALE_MS) { S.whale = null; return; }
+  const WC = CFG.whale.colors;
+  const body = mixHex(WC.body, CFG.nightTint.color, dark * .5), lit = mixHex(WC.body, '#ffffff', .25 * (1 - dark) + .08);
+  const cx = Math.round(wh.x + wh.dir * a * .0012 * k), wy = wh.y;
+  const ease = (p0, p1) => clamp((a - p0) / (p1 - p0), 0, 1);
+  const bump = (p0, p1) => Math.sin(ease(p0, p1) * Math.PI);
+  const foam = (x0, w) => {                                // white water where it breaks the surface
+    b.fillStyle = '#e8eef8';
+    for (let x = x0; x < x0 + w; x++) if (Math.sin(x * 1.7 + t * .02) > -.2) { b.globalAlpha = .7; b.fillRect(x, wy, 1, 1); }
+    b.globalAlpha = 1;
+  };
+
+  // 1. the spout: a column of spray that rises and drifts away
+  if (a < 3500) {
+    const p = a / 3500, hgt = Math.round(14 * k * Math.min(1, p * 3)), spread = 1 + p * 5 * k;
+    b.fillStyle = WC.spout;
+    for (let i = 0; i < hgt; i++) {
+      const f = i / Math.max(1, hgt), w = Math.max(1, Math.round(1 + f * spread));
+      b.globalAlpha = (1 - p) * (.35 + .5 * f) * (Math.sin(i * 2.3 + t * .01) > -.6 ? 1 : .3);
+      b.fillRect(cx - (w >> 1) + Math.round(Math.sin(i * .9) * f), wy - i, w, 1);
+    }
+    b.globalAlpha = 1;
+  }
+  // 2. its back rolls up out of the water and under again
+  const back = bump(1500, 7000);
+  if (back > 0) {
+    const half = Math.round(12 * k), hgt = back * 3.2 * k;
+    for (let dx = -half; dx <= half; dx++) {
+      const hh = Math.round(hgt * Math.sqrt(Math.max(0, 1 - (dx / half) ** 2)));
+      if (hh <= 0) continue;
+      b.fillStyle = body; b.fillRect(cx + dx, wy - hh, 1, hh);
+      b.fillStyle = lit; b.fillRect(cx + dx, wy - hh, 1, 1);
+    }
+    const fin = cx - wh.dir * Math.round(half * .45);           // small dorsal fin
+    if (back > .5) { b.fillStyle = body; b.fillRect(fin, wy - Math.round(hgt) - 1, 2, 1); b.fillRect(fin + (wh.dir > 0 ? 1 : 0), wy - Math.round(hgt) - 2, 1, 1); }
+    foam(cx - half, half * 2 + 1);
+  }
+  // 3. the tail lifts, water streaming off it, and slides back under
+  const tail = bump(7500, 13000);
+  if (tail > 0) {
+    const tx = cx - wh.dir * Math.round(14 * k), h = Math.round(tail * 11 * k), fh = Math.max(2, Math.round(3 * k));
+    const sw = Math.max(1, Math.round(2 * k));
+    if (h > fh) { b.fillStyle = body; b.fillRect(tx - (sw >> 1), wy - h + fh, sw, h - fh); }
+    for (let dy = 0; dy < Math.min(fh, h); dy++) {
+      const y = wy - h + dy, half = Math.round(6 * k * (1 - dy / fh * .75));
+      b.fillStyle = dy === 0 ? lit : body;
+      b.fillRect(tx - half, y, half, 1); b.fillRect(tx + 1, y, half, 1);   // two flukes with a notch
+    }
+    b.fillStyle = WC.spout;
+    for (let i = 0; i < 6; i++) {                                       // drips
+      const dx = Math.round((i - 2.5) * 2 * k), fall = ((a * .02 + i * 7) % Math.max(1, h));
+      b.globalAlpha = .6; b.fillRect(tx + dx, Math.round(wy - h + fh + fall), 1, 1);
+    }
+    b.globalAlpha = 1;
+    foam(tx - Math.round(3 * k), Math.round(6 * k));
+  }
+  // 4. rings spreading where it went down
+  if (a > 12500) {
+    const p = (a - 12500) / (WHALE_MS - 12500), rx = Math.round(4 * k + p * 14 * k), tx = cx - wh.dir * Math.round(14 * k);
+    b.globalAlpha = .5 * (1 - p); b.fillStyle = '#e8eef8';
+    b.fillRect(tx - rx, wy, Math.max(1, Math.round(rx * .4)), 1); b.fillRect(tx + rx - Math.round(rx * .4), wy, Math.max(1, Math.round(rx * .4)), 1);
+    b.fillRect(tx - Math.round(rx * .5), wy + 1, rx, 1);
+    b.globalAlpha = 1;
+  }
+}
+
+// little 5×3 gull shapes: wings up, level, down
+const GULL = [
+  ['x...x', '.x.x.', '..x..'],
+  ['.....', 'xx.xx', '..x..'],
+  ['.....', '..x..', 'x.x.x'],
+];
+
+/* ------------------------------------------------------------------
+ * Drawing
+ * ------------------------------------------------------------------ */
+const darkness = (S, t) => .5 - .5 * Math.cos(TAU * (t + S.tOff) / S.cycle);
+
+function refreshGradients(S, dark) {
+  const sky = CFG.sky.colors, wat = CFG.water.colors;
+  const skyStops = sky.dusk.map((c, i) => mix(hexRgb(c), hexRgb(sky.night[i] || sky.night.at(-1)), dark));
+  const watStops = wat.dusk.map((c, i) => mix(hexRgb(c), hexRgb(wat.night[i] || wat.night.at(-1)), dark));
+  const { W, H, horizon: hz } = S;
+  const si = S.skyCan.getContext('2d').createImageData(W, hz);
+  ditherRows(si, 0, hz, skyStops);
+  S.skyCan.getContext('2d').putImageData(si, 0, 0);
+  const wi = S.waterCan.getContext('2d').createImageData(W, H - hz);
+  ditherRows(wi, 0, H - hz, watStops);
+  S.waterCan.getContext('2d').putImageData(wi, 0, 0);
+  const glint = mix(hexRgb(wat.glint.dusk), hexRgb(wat.glint.night), dark);
+  S.rowGlint = [];
+  for (let y = 0; y < H - hz; y++) S.rowGlint[y] = css(mix(gradientAt(watStops, y / (H - hz)), glint, .7));
+  S.lastSkyDark = dark;
+}
+
+function drawSprite(b, day, night, x, y, dark) {
+  b.drawImage(day, x, y);
+  if (dark > .01) { b.globalAlpha = dark; b.drawImage(night, x, y); b.globalAlpha = 1; }
+}
+
+function render(b, S, t) {
+  const { W, H, horizon: hz, k } = S;
+  const dark = darkness(S, t);
+  if (Math.abs(dark - S.lastSkyDark) > .006) refreshGradients(S, dark);
+
+  // sky
+  b.drawImage(S.skyCan, 0, 0);
+  const SC = CFG.stars.colors;
+  for (const s of S.stars) {
+    if (dark <= s.th) continue;
+    b.globalAlpha = Math.min(1, (dark - s.th) * 4) * (.55 + .45 * Math.sin(t * s.sp + s.ph));
+    b.fillStyle = SC[s.c]; b.fillRect(s.x, s.y, 1, 1);
+  }
+  b.globalAlpha = 1;
+
+  // sun, sinking as it gets dark
+  const sunC = CFG.sun.colors, r = S.sunR;
+  const cy = hz - r * .7 + dark * r * 3.2;
+  if (cy - r < hz) {
+    glow(b, S.sunX, Math.min(cy, hz), r * 3.5, sunC.glow, .35 * (1 - dark));
+    b.fillStyle = mixHex(sunC.disc, sunC.setting, clamp(dark * 2, 0, 1));
+    for (let dy = -r; dy <= r; dy++) {
+      const y = Math.round(cy + dy);
+      if (y >= hz) break;
+      const hw = Math.round(Math.sqrt(r * r - dy * dy));
+      b.fillRect(S.sunX - hw, y, hw * 2 + 1, 1);
+    }
+  }
+
+  // scenery on the horizon
+  drawSprite(b, S.scenDay, S.scenNight, 0, 0, dark);
+  for (const l of S.townLights) {
+    if (dark <= l.th) continue;
+    b.globalAlpha = Math.min(1, (dark - l.th) * 5) * (.8 + .2 * Math.sin(t * .001 + l.ph));
+    b.fillStyle = l.c; b.fillRect(l.x, l.y, 1, 1);
+  }
+  b.globalAlpha = 1;
+  if (dark > .3) {
+    const w = S.cottageWin;
+    b.globalAlpha = Math.min(1, (dark - .3) * 4);
+    b.fillStyle = CFG.pier.colors.lamp; b.fillRect(w.x, w.y, w.w, w.h);
+    b.globalAlpha = 1;
+  }
+
+  // lighthouse beam and lamp
+  const LC = CFG.lighthouse.colors, L = S.lamp;
+  const th = TAU * t / S.beamMs + S.beamPh, cth = Math.cos(th), sth = Math.sin(th);
+  const on = clamp((dark - .05) * 4, 0, 1);
+  if (on > 0) {
+    const len = W * .9 * Math.abs(cth), ex = L.x + Math.sign(cth) * len, spread = (2 + 9 * Math.abs(cth)) * k;
+    const a = on * (.12 + .45 * dark) * Math.sqrt(Math.abs(cth));
+    if (len > 2 && a > .01) {
+      const g = b.createLinearGradient(L.x, L.y, ex, L.y);
+      g.addColorStop(0, LC.beam); g.addColorStop(1, 'rgba(255,240,192,0)');
+      b.globalAlpha = a; b.fillStyle = g;
+      b.beginPath(); b.moveTo(L.x, L.y - 1); b.lineTo(ex, L.y - spread); b.lineTo(ex, L.y + spread * .7); b.lineTo(L.x, L.y + 1); b.fill();
+      b.globalAlpha = 1;
+    }
+    const face = Math.max(0, sth) ** 10;
+    b.globalAlpha = on; b.fillStyle = LC.lamp;
+    b.fillRect(L.x - (L.w >> 1), L.top, L.w, L.h);
+    b.globalAlpha = 1;
+    glow(b, L.x, L.y, (3 + 10 * face) * k, LC.lamp, on * (.5 + .5 * face));
+  }
+
+  // water: the sky above, mirrored and wobbling, under the water's own colour
+  const m = S.mirror.getContext('2d');
+  m.clearRect(0, 0, W, hz); m.drawImage(b.canvas, 0, 0, W, hz, 0, 0, W, hz);
+  b.drawImage(S.waterCan, 0, hz);
+  for (let y = 0; y < H - hz; y++) {
+    const d = y / (H - hz);
+    const src = clamp(hz - 1 - y + Math.round(Math.sin(t * .0011 + y * .9) * d * 2), 0, hz - 1);
+    const off = Math.round(Math.sin(t * .0016 + y * .45) * (.4 + d * 3) * k);
+    b.drawImage(S.mirror, 0, src, W, 1, off, hz + y, W, 1);
+  }
+  b.globalAlpha = CFG.water.tint; b.drawImage(S.waterCan, 0, hz); b.globalAlpha = 1;
+
+  // glints; brighter and coloured in the paths of the sun and the lamps
+  const sunUp = clamp(1 - dark * 1.8, 0, 1), sunCol = CFG.sun.colors.disc;
+  const pierOn = clamp((dark - S.pierLamp.th) * 5, 0, 1);
+  const paths = [
+    { x: S.sunX, s: sunUp, c: sunCol, w: d => 3 + d * W * .08 },
+    { x: L.x, s: on * (.35 + .65 * Math.max(0, sth) ** 4) * .9, c: LC.lamp, w: d => 1 + d * 8 * k },
+    { x: S.pierLamp.x, s: pierOn * .8, c: CFG.pier.colors.lamp, w: d => 1 + d * 6 * k },
+  ];
+  for (const rp of S.ripples) {
+    const v = Math.sin(t * rp.sp + rp.ph);
+    const yy = rp.y - hz, d = yy / (H - hz);
+    const x = Math.round(rp.x + Math.sin(t * .0004 + rp.ph) * 2);
+    let col = S.rowGlint[yy], a = (v - .4) / .6;
+    for (const p of paths) {
+      if (p.s < .05) continue;
+      const dx = Math.abs(x - p.x), w = p.w(d);
+      if (dx < w) { col = p.c; a = Math.max(a, (v + .2) / 1.2 * p.s * (1 - dx / w)); }
+    }
+    if (a <= .02) continue;
+    b.globalAlpha = Math.min(1, a); b.fillStyle = col; b.fillRect(x, rp.y, rp.len, 1);
+  }
+  b.globalAlpha = 1;
+
+  if (S.whale) drawWhale(b, S, t, dark);
+
+  // boats, far to near, each with a wobbly reflection
+  const passing = S.passing.filter(p => { p.x = Math.round(p.x0 + p.vx * (t - p.t0)); return p.x > -p.w - 4 && p.x < W + 4; });
+  S.passing = passing;
+  const all = [...S.boats, ...passing].sort((a, b) => a.y - b.y);
+  for (const bt of all) drawBoat(b, S, bt, t, dark);
+
+  // pier
+  drawSprite(b, S.pierDay, S.pierNight, 0, 0, dark);
+  if (pierOn > 0) {
+    const pl = S.pierLamp;
+    b.globalAlpha = pierOn; b.fillStyle = CFG.pier.colors.lamp; b.fillRect(pl.x - 1, pl.y, 3, 1); b.globalAlpha = 1;
+    glow(b, pl.x, pl.y, 12 * k, CFG.pier.colors.lamp, .45 * pierOn);
+  }
+
+  // gulls
+  b.fillStyle = CFG.gulls.colors.body;
+  S.gulls = S.gulls.filter(g => {
+    const x = Math.round(g.x0 + g.vx * (t - g.t0)), y = Math.round(g.y + Math.sin(t * .0012 + g.bobPh) * 2 * k);
+    const f = Math.floor(t / g.flapMs + g.ph) % 4, shape = GULL[f === 3 ? 1 : f];
+    shape.forEach((row, ry) => { for (let rx = 0; rx < 5; rx++) if (row[rx] === 'x') b.fillRect(x + rx, y + ry, 1, 1); });
+    return x > -10 && x < W + 10;
+  });
+
+  drawClock(b, S.clock);
+}
+
+function drawBoat(b, S, bt, t, dark) {
+  const bob = Math.round(Math.sin(TAU * t / bt.bobMs + bt.ph) * bt.amp);
+  const top = bt.y - bt.h + 1 + bob, { k } = S;
+  // reflection: sprite rows mirrored below the waterline, shifted row by row
+  const rows = Math.min(bt.h, S.H - bt.y - 1);
+  for (let r = 0; r < rows; r++) {
+    const src = bt.h - 1 - r, off = Math.round(Math.sin(t * .002 + r * .7 + bt.ph) * (.3 + r * .08) * k);
+    const y = bt.y + 1 + r + bob;
+    b.globalAlpha = .28 * (1 - dark); b.drawImage(bt.day, 0, src, bt.w, 1, bt.x + off, y, bt.w, 1);
+    b.globalAlpha = .28 * dark; b.drawImage(bt.night, 0, src, bt.w, 1, bt.x + off, y, bt.w, 1);
+  }
+  b.globalAlpha = 1;
+  drawSprite(b, bt.day, bt.night, bt.x, top, dark);
+  // wake behind a moving boat
+  if (bt.vx) {
+    const dir = Math.sign(bt.vx), sx = dir > 0 ? bt.x - 1 : bt.x + bt.w;
+    b.fillStyle = '#e8e8f0';
+    for (let i = 0; i < bt.w * 1.5; i++) {
+      if (Math.sin(t * .01 + i) < .2) continue;
+      b.globalAlpha = .5 * (1 - i / (bt.w * 1.5));
+      b.fillRect(sx - dir * i, bt.y + bob + (i % 3 === 0 ? 1 : 0), 1, 1);
+    }
+    b.globalAlpha = 1;
+  }
+  for (const l of bt.lights) {
+    if (dark <= l.th) continue;
+    const a = Math.min(1, (dark - l.th) * 5);
+    b.globalAlpha = a; b.fillStyle = l.c;
+    b.fillRect(bt.x + l.x, top + l.y, l.w || 1, 1);
+    b.globalAlpha = a * .35; b.fillRect(bt.x + l.x, bt.y + bob + 2 + (bt.h - l.y), l.w || 1, 2);   // its reflection
+    b.globalAlpha = 1;
+    if (!l.w) glow(b, bt.x + l.x, top + l.y, 3 * k, l.c, .35 * a);
+  }
+}
+
+/* ------------------------------------------------------------------
+ * Clock (settings in config.js under `clock`)
+ * ------------------------------------------------------------------ */
+const CLOCK_FONTS = {
+  pixel: { h: 7, g: {
+    '0': [' ### ', '#   #', '#  ##', '# # #', '##  #', '#   #', ' ### '],
+    '1': ['  #  ', ' ##  ', '  #  ', '  #  ', '  #  ', '  #  ', ' ### '],
+    '2': [' ### ', '#   #', '    #', '   # ', '  #  ', ' #   ', '#####'],
+    '3': ['#####', '   # ', '  #  ', '   # ', '    #', '#   #', ' ### '],
+    '4': ['   # ', '  ## ', ' # # ', '#  # ', '#####', '   # ', '   # '],
+    '5': ['#####', '#    ', '#### ', '    #', '    #', '#   #', ' ### '],
+    '6': ['  ## ', ' #   ', '#    ', '#### ', '#   #', '#   #', ' ### '],
+    '7': ['#####', '    #', '   # ', '  #  ', ' #   ', ' #   ', ' #   '],
+    '8': [' ### ', '#   #', '#   #', ' ### ', '#   #', '#   #', ' ### '],
+    '9': [' ### ', '#   #', '#   #', ' ####', '    #', '   # ', ' ##  '],
+    ':': [' ', ' ', '#', ' ', '#', ' ', ' '],
+  } },
+  small: { h: 5, g: {
+    '0': ['###', '# #', '# #', '# #', '###'], '1': [' # ', '## ', ' # ', ' # ', '###'],
+    '2': ['###', '  #', '###', '#  ', '###'], '3': ['###', '  #', '###', '  #', '###'],
+    '4': ['# #', '# #', '###', '  #', '  #'], '5': ['###', '#  ', '###', '  #', '###'],
+    '6': ['###', '#  ', '###', '# #', '###'], '7': ['###', '  #', '  #', '  #', '  #'],
+    '8': ['###', '# #', '###', '# #', '###'], '9': ['###', '# #', '###', '  #', '###'],
+    ':': [' ', '#', ' ', '#', ' '],
+    'A': ['###', '# #', '###', '# #', '# #'], 'P': ['###', '# #', '###', '#  ', '#  '], 'M': ['# #', '###', '###', '# #', '# #'],
+  } },
+};
+// LED digits: which segments each digit lights, and the cells of each segment in a 4×7 box
+const CLOCK_DIGITS = ['abcdef', 'bc', 'abged', 'abgcd', 'fgbc', 'afgcd', 'afgedc', 'abc', 'abcdefg', 'abcdfg'];
+const CLOCK_SEGMENTS = { a: [[1, 0], [2, 0]], b: [[3, 1], [3, 2]], c: [[3, 4], [3, 5]], d: [[1, 6], [2, 6]],
+  e: [[0, 4], [0, 5]], f: [[0, 1], [0, 2]], g: [[1, 3], [2, 3]] };
+
+// The current time as lists of lit (and, for LED digits, unlit) cells in font pixels
+function clockLayout(now) {
+  const C = CFG.clock, pad = n => String(n).padStart(2, '0');
+  let h = now.getHours(), suffix = '';
+  if (C.hour12) { suffix = h < 12 ? 'AM' : 'PM'; h = h % 12 || 12; }
+  const txt = (C.hour12 ? String(h) : pad(h)) + ':' + pad(now.getMinutes()) + (C.seconds ? ':' + pad(now.getSeconds()) : '');
+  const colonOn = !C.blinkColon || now.getMilliseconds() < 500;
+  const seg = C.font === 'segment', F = CLOCK_FONTS[C.font] || CLOCK_FONTS.pixel, fh = seg ? 7 : F.h;
+  const on = [], off = [];
+  const put = (rows, x0, y0, list) => rows.forEach((row, y) => {
+    for (let i = 0; i < row.length; i++) if (row[i] === '#') list.push([x0 + i, y0 + y]);
+  });
+  let x = 0;
+  for (const ch of txt) {
+    if (ch === ':') { put(seg ? CLOCK_FONTS.pixel.g[':'] : F.g[':'], x, 0, colonOn ? on : off); x += 2; }
+    else if (seg) {
+      const lit = CLOCK_DIGITS[+ch];
+      for (const [s, cells] of Object.entries(CLOCK_SEGMENTS)) for (const [cx, cy] of cells) (lit.includes(s) ? on : off).push([x + cx, cy]);
+      x += 5;
+    } else { put(F.g[ch], x, 0, on); x += F.g[ch][0].length + 1; }
+  }
+  if (suffix) {
+    const S = CLOCK_FONTS.small;
+    x += 1;
+    for (const ch of suffix) { put(S.g[ch], x, fh - S.h, on); x += 4; }
+  }
+  return { on, off, w: x - 1, h: fh };
+}
+
+// anchor: { x, y, align: 'left' | 'center' | 'right', valign: 'top' | 'bottom', scale, box } in art pixels;
+// unit = screen pixels per art pixel (1 when drawing into the art-sized buffer)
+function drawClock(g, anchor, unit = 1) {
+  const C = CFG.clock;
+  if (!C.show || !anchor) return;
+  const now = new Date(), L = clockLayout(now);
+  const s = Math.max(1, Math.round(C.size * (anchor.scale || 1)));
+  const w = L.w * s, h = L.h * s;
+  let x = anchor.align === 'right' ? anchor.x - w : anchor.align === 'center' ? anchor.x - Math.round(w / 2) : anchor.x;
+  let y = anchor.valign === 'bottom' ? anchor.y - h : anchor.y;
+  if (C.drift && !anchor.box) {              // wander a pixel or two each minute so it can't burn into the screen
+    const m = now.getHours() * 60 + now.getMinutes();
+    x += Math.round(Math.sin(m * .7) * 2 * s); y += Math.round(Math.cos(m * .45) * 1.5 * s);
+  }
+  const rect = (px, py, rw, rh) => g.fillRect((x + px) * unit, (y + py) * unit, rw * unit, rh * unit);
+  if (anchor.box) {                          // a little bedside-clock case
+    const p = 2 * s;
+    g.fillStyle = C.colors.box; rect(-p, -p, w + p * 2, h + p * 2);
+    g.fillStyle = 'rgba(255,255,255,.1)'; rect(-p, -p, w + p * 2, 1);
+    g.fillStyle = 'rgba(0,0,0,.45)'; rect(-p, h + p - 1, w + p * 2, 1);
+  }
+  if (C.glow > 0) {
+    g.globalAlpha = .16 * C.glow; g.fillStyle = C.colors.glow;
+    for (const [px, py] of L.on) rect(px * s - s, py * s - s, s * 3, s * 3);
+  }
+  g.fillStyle = C.colors.text;
+  if (L.off.length) { g.globalAlpha = .1; for (const [px, py] of L.off) rect(px * s, py * s, s, s); }
+  g.globalAlpha = 1;
+  for (const [px, py] of L.on) rect(px * s, py * s, s, s);
+}
+
+// A fixed clock position: a corner or the middle of the top or bottom edge
+function clockCorner(pos, W, H, margin) {
+  const top = !pos.startsWith('bottom');
+  const align = pos.endsWith('left') ? 'left' : pos.endsWith('right') ? 'right' : 'center';
+  return { x: align === 'left' ? margin : align === 'right' ? W - margin : Math.round(W / 2),
+    y: top ? margin : H - margin, align, valign: top ? 'top' : 'bottom' };
+}
+// The scene's own spot when position is 'auto', otherwise the chosen corner
+function clockAnchor(auto, W, H, k) {
+  const pos = CFG.clock.position;
+  const a = pos === 'auto' ? auto : clockCorner(pos, W, H, Math.round(8 * k));
+  return { ...a, scale: k, box: pos === 'auto' && auto.box };
+}
+
+/* ------------------------------------------------------------------
+ * App: sizing, seed, resize, input
+ * ------------------------------------------------------------------ */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const buf = makeCanvas(1, 1), bctx = buf.getContext('2d', { willReadFrequently: false });
+let seed = parseSeed(), scene = null;
+
+function parseSeed() {
+  if (Number.isFinite(CFG.display.seed)) return CFG.display.seed >>> 0;
+  const n = parseInt(location.hash.slice(1), 10);
+  return Number.isFinite(n) ? n >>> 0 : (Math.random() * 2 ** 32) >>> 0;
+}
+
+function setup() {
+  const dpr = window.devicePixelRatio || 1;
+  const cw = Math.max(1, Math.floor(innerWidth * dpr)), ch = Math.max(1, Math.floor(innerHeight * dpr));
+  canvas.width = cw; canvas.height = ch;
+  const px = Math.max(1, Math.round(Math.min(cw, ch) / CFG.display.targetRows));
+  const W = Math.ceil(cw / px), H = Math.ceil(ch / px);
+  buf.width = W; buf.height = H;
+  scene = generateScene(seed, W, H);
+  scene.px = px;
+  // start with something on the move
+  if (CFG.display.animate) { scene.lastRoll.boat = scene.lastRoll.gull = scene.lastRoll.whale = performance.now(); }
+  history.replaceState(null, '', '#' + seed);
+  draw(performance.now());
+}
+
+function tick(S, t) {
+  const B = CFG.boats, G = CFG.gulls;
+  if (t - S.lastRoll.boat > B.passingEverySeconds * 1000) {
+    S.lastRoll.boat = t;
+    if (Math.random() < B.passingChance && S.passing.length < 2) spawnPassingBoat(S, t);
+  }
+  if (t - S.lastRoll.gull > G.everySeconds * 1000) {
+    S.lastRoll.gull = t;
+    if (Math.random() < G.chance * (1 - darkness(S, t))) spawnGulls(S, t);
+  }
+  if (t - S.lastRoll.whale > CFG.whale.everyMinutes * 60000) {
+    S.lastRoll.whale = t;
+    if (Math.random() < CFG.whale.chance) spawnWhale(S, t);
+  }
+}
+
+function draw(t) {
+  tick(scene, t);
+  render(bctx, scene, t);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(buf, 0, 0, scene.W * scene.px, scene.H * scene.px);
+}
+
+let lastDraw = -Infinity;
+function loop(t) {
+  requestAnimationFrame(loop);
+  if (FRAME_INTERVAL) {
+    if (t - lastDraw < FRAME_INTERVAL - 1.5) return;
+    lastDraw = Math.max(lastDraw + FRAME_INTERVAL, t - FRAME_INTERVAL);
+  }
+  draw(t);
+}
+
+function regenerate() { seed = (Math.random() * 2 ** 32) >>> 0; setup(); }
+
+let resizeTimer = 0;
+addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(setup, 100); });
+if (CFG.display.clickToRegenerate) canvas.addEventListener('click', regenerate);
+else canvas.style.cursor = 'default';
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase(), now = performance.now();
+  if (k === 'r' && CFG.display.clickToRegenerate) regenerate();
+  if (k === 'b') spawnPassingBoat(scene, now);
+  if (k === 'g') spawnGulls(scene, now);
+  if (k === 't') scene.tOff += scene.cycle / 2;
+  // X = this scene's rare visitor (Shift+X = its variation, where it has one)
+  if (k === 'x') spawnWhale(scene, now);
+  if (!CFG.display.animate) draw(now);
+});
+
+setup();
+if (CFG.display.animate) {
+  spawnGulls(scene, performance.now());
+  requestAnimationFrame(loop);
+}
+
+window.harbour = { get scene() { return scene; }, draw, setup, regenerate, spawnWhale };
+</script>
+</body>
+</html>

@@ -9,7 +9,7 @@ row has, how often cars, pedestrians and shooting stars appear, how lively the w
 cap, and so on. Edit and restart the screensaver (or reload the page). Anything you delete falls back to the
 default built into the page.
 
-Run with `HtmlScreensaver.scr /debug /scene:cityscape-night` to try it full screen.
+Run `HtmlScreensaver-Setup.exe /debug /scene:cityscape-night` to try it full screen.
 
 When opened in a browser, the number after `#` in the address is the city's seed; keep it to see the same
 city again, or set `display.seed` in the config. These test keys work in a browser or in the `/debug` window

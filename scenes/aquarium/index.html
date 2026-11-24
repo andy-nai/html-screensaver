@@ -59,7 +59,7 @@ const DEFAULTS = {
   },
   bubbles: { vents: [1, 3], everySeconds: .8, colors: { bubble: '#d8f6ff' } },
   jellyfish: { everySeconds: 60, chance: .4, colors: ['#e8a8ff', '#ffb0d8', '#a8d8ff'] },
-  turtle: { everyMinutes: 5, chance: .5, colors: { shell: '#5e7c3c', pattern: '#3e5a2a', rim: '#c8b070', skin: '#9ab070' } },
+  turtle: { colors: { shell: '#5e7c3c', pattern: '#3e5a2a', rim: '#c8b070', skin: '#9ab070' } },
   particles: { density: 1, colors: { speck: '#cfefff' } },
   clock: { show: true, hour12: false, seconds: false, position: 'auto', font: 'pixel', size: 1,
     blinkColon: false, drift: true, glow: 0.6, colors: { text: '#e0fcff', glow: '#7ae8ff', box: '#161214' } },
@@ -78,6 +78,10 @@ function mergeConfig(base, over, path = '') {
 }
 const CFG = mergeConfig(DEFAULTS, window.AQUARIUM_CONFIG);
 const FRAME_INTERVAL = CFG.display.frameRate > 0 ? 1000 / CFG.display.frameRate : 0;
+
+// Rare visitors: checked once a minute with a 1-in-30 chance, so about once every 30 minutes but
+// never predictably. When a visitor has a variant (Shift+X), 1 visit in 10 is the variant.
+const RARE_CHECK_MS = 60 * 1000, RARE_CHANCE = 1 / 30, RARE_VARIANT = 1 / 10;
 
 /* ------------------------------------------------------------------
  * Helpers: RNG, colour, dithering, noise
@@ -407,10 +411,23 @@ function spawnJelly(S, t) {
     pulseMs: 2600 + Math.random() * 1200, vx: (Math.random() - .5) * 1.5 * S.k / 1000,
     col: CFG.jellyfish.colors[Math.floor(Math.random() * CFG.jellyfish.colors.length)], n: 5 });
 }
-function spawnTurtle(S, t) {
+// The variant: partway across, the turtle swims up, pokes its head out of the surface for a breath
+// (ripples spreading round it), then glides back down, breathing out a stream of bubbles.
+function spawnTurtle(S, t, breathe = Math.random() < RARE_VARIANT) {
   const right = Math.random() < .5, w = 28 * S.ps;
-  S.turtles.push({ right, x: right ? -w - 2 : S.W + 2, y: S.H * (.25 + Math.random() * .35), vx: (right ? 1 : -1) * 4 * S.k / 1000, ph: Math.random() * TAU });
+  S.turtles.push({ right, x: right ? -w - 2 : S.W + 2, y: S.H * (.25 + Math.random() * .35), vx: (right ? 1 : -1) * 4 * S.k / 1000, ph: Math.random() * TAU,
+    breathe, xm: S.W * (.35 + Math.random() * .3), span: S.W * .15, surfaced: false, exhaled: false });
 }
+// 0 = cruising at its own depth, 1 = head out at the surface (with a short pause there)
+function turtleLift(S, tt) {
+  if (!tt.breathe) return 0;
+  const headX = tt.x + (tt.right ? 25 : 2) * S.ps;
+  const b = 1 - Math.abs(headX - tt.xm) / tt.span;
+  if (b <= 0) return 0;
+  const f = Math.min(1, b / .8);
+  return f * f * (3 - 2 * f);
+}
+function turtleHead(S, tt) { return tt.x + (tt.right ? 25 : 2) * S.ps; }
 function burst(S, t) {
   const v = S.vents[Math.floor(Math.random() * S.vents.length)];
   if (!v) return;
@@ -493,8 +510,20 @@ function render(b, S, t) {
 
   for (const tt of S.turtles) {
     const frame = Math.floor(t / 900 + tt.ph) % 2, sp = S.turtleSprites[frame];
-    const y = tt.y + Math.sin(t * .0005 + tt.ph) * 3 * k;
+    const lift = turtleLift(S, tt), atSurface = 4 * k - 6 * ps;          // head row (6) right at the surface
+    const y = tt.y + (atSurface - tt.y) * lift + Math.sin(t * .0005 + tt.ph) * 3 * k * (1 - lift);
     b.drawImage(tt.right ? sp.right : sp.left, Math.round(tt.x), Math.round(y), 28 * ps, 15 * ps);
+    if (lift > .9) {                                                    // ripples spreading round its head
+      const hx = turtleHead(S, tt);
+      b.fillStyle = '#ffffff';
+      for (const off of [0, 600]) {
+        const p = ((t + off) % 1200) / 1200, r = (2 + p * 14) * k;
+        b.globalAlpha = .8 * (1 - p) * (lift - .9) * 10;
+        b.fillRect(Math.round(hx - r), Math.round(4 * k), Math.max(1, Math.round(2 * k)), 1);
+        b.fillRect(Math.round(hx + r), Math.round(4 * k), Math.max(1, Math.round(2 * k)), 1);
+      }
+      b.globalAlpha = 1;
+    }
   }
   for (const j of S.jellies) drawJelly(b, S, j, t);
 
@@ -749,15 +778,25 @@ function tick(S, t) {
     j.x += j.vx * dt;
     return j.y > -j.r * 4;
   });
-  S.turtles = S.turtles.filter(tt => { tt.x += tt.vx * dt; return tt.x > -30 * S.ps && tt.x < S.W + 4; });
+  S.turtles = S.turtles.filter(tt => {
+    const lift = turtleLift(S, tt);
+    tt.x += tt.vx * dt * (1 - .65 * lift);             // slows down while it takes a breath
+    if (lift > .95) tt.surfaced = true;
+    if (tt.surfaced && !tt.exhaled && lift < .6) {     // breathing out on the way back down
+      tt.exhaled = true;
+      const top = tt.y + (4 * S.k - 6 * S.ps - tt.y) * lift, head = { x: turtleHead(S, tt), y: top + 7 * S.ps };
+      for (let i = 0; i < 10; i++) addBubble(S, head, t + i * 120);
+    }
+    return tt.x > -30 * S.ps && tt.x < S.W + 4;
+  });
 
   if (t - S.lastRoll.jelly > CFG.jellyfish.everySeconds * 1000) {
     S.lastRoll.jelly = t;
     if (Math.random() < CFG.jellyfish.chance && S.jellies.length < 3) spawnJelly(S, t);
   }
-  if (t - S.lastRoll.turtle > CFG.turtle.everyMinutes * 60000) {
+  if (t - S.lastRoll.turtle > RARE_CHECK_MS) {
     S.lastRoll.turtle = t;
-    if (Math.random() < CFG.turtle.chance && !S.turtles.length) spawnTurtle(S, t);
+    if (Math.random() < RARE_CHANCE && !S.turtles.length) spawnTurtle(S, t);
   }
 }
 
@@ -791,7 +830,7 @@ addEventListener('keydown', e => {
   if (k === 's' && scene.schools.length < 4) addSchool(scene);
   if (k === 'j') spawnJelly(scene, now);
   // X = this scene's rare visitor (Shift+X = its variation, where it has one)
-  if (k === 'x') spawnTurtle(scene, now);
+  if (k === 'x') spawnTurtle(scene, now, e.shiftKey || undefined);
   if (k === 'b') burst(scene, now);
   if (!CFG.display.animate) draw(now);
 });

@@ -10,21 +10,36 @@ built into Windows 11 and most up-to-date Windows 10 machines.
 
 ## Install
 
-Download `HtmlScreensaver-Setup.exe` from the latest [release](../../releases/latest) and run it. It installs for your account only (no admin rights needed) and sets
-HTML Screensaver as your screensaver. Then choose the wait time in Windows' Screen Saver Settings,
-which the installer offers to open.
+Download `HtmlScreensaver-Setup.exe` from the latest [release](../../releases/latest) and run it. Choose who
+it's for, press **Install**, and it shows its progress as it goes:
+
+| Install for | Where it goes | Admin rights |
+|---|---|---|
+| **Just me** | `%LOCALAPPDATA%\Programs\HtmlScreensaver` | not needed |
+| **Everyone on this PC** | `%ProgramFiles%\HtmlScreensaver`, plus a copy of the `.scr` in `System32` so it's in every user's Screen Saver Settings list | asks for them |
+
+Either way it becomes your screensaver straight away. A screensaver is a per-user Windows setting, so with
+**Everyone**, other people on the PC choose it in their own Screen Saver Settings. Set how long Windows waits
+before starting it in Screen Saver Settings, which the installer offers to open when it's done.
 
 Running the installer again updates the screensaver and its included scenes; scenes you added
 yourself are kept.
 
 Uninstall from **Settings > Apps > Installed apps > HTML Screensaver**.
 
-Everything is installed to `%LOCALAPPDATA%\Programs\HtmlScreensaver`:
+The install folder looks like this:
 
 ```
 HtmlScreensaver.scr   the screensaver
 scenes\               one sub-folder per scene
   <scene-name>\       index.html, plus any assets it uses
+```
+
+To install without the window (for example from a script), add `/quiet`, and `/allusers` for everyone (run it
+from an administrator prompt for that):
+
+```powershell
+.\HtmlScreensaver-Setup.exe /quiet /allusers
 ```
 
 ## Scenes
@@ -76,7 +91,8 @@ targets whichever is installed).
 
 Output: `dist\HtmlScreensaver-Setup.exe`, a single file with the scenes inside. The installer and the
 screensaver are the same program: named `*.scr` it's the screensaver, under any other name it installs
-itself. `/quiet` skips the installer's dialogs, and `/uninstall` removes it.
+itself (`Installer.cs` does the work, `InstallerForm.cs` is the window). `/allusers` installs for everyone,
+`/quiet` skips the window, and `/uninstall` removes it.
 
 The only third-party dependency is the `Microsoft.Web.WebView2` NuGet package, which is compiled into the exe.
 

@@ -4,6 +4,10 @@ A Windows screensaver that picks a random **scene** (a folder containing an `ind
 it starts and shows it full screen on every monitor. It uses the Edge WebView2 runtime, which is
 built into Windows 11 and most up-to-date Windows 10 machines.
 
+> **AI disclaimer:** this project was built largely with an AI coding assistant (Claude), including the
+> screensaver, the installer and the scenes. It's a personal experiment made for my own use, shared as-is in
+> case anyone else enjoys it.
+
 ## Install
 
 Download `HtmlScreensaver-Setup.exe` from the latest [release](../../releases/latest) and run it. It installs for your account only (no admin rights needed) and sets

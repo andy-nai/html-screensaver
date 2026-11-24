@@ -15,7 +15,11 @@ static class Program
         bool debug = args.Any(a => a.Equals("/debug", StringComparison.OrdinalIgnoreCase));
         string? forcedScene = args
             .FirstOrDefault(a => a.StartsWith("/scene:", StringComparison.OrdinalIgnoreCase))?[7..];
-        string mode = "c";
+        // /install and /uninstall (plus /quiet) are handled by Installer. Run with no arguments under any
+        // name other than *.scr (e.g. HtmlScreensaver-Setup.exe), it's the installer.
+        bool quiet = args.Any(a => a.Equals("/quiet", StringComparison.OrdinalIgnoreCase));
+        bool isScr = Path.GetExtension(Environment.ProcessPath ?? "").Equals(".scr", StringComparison.OrdinalIgnoreCase);
+        string mode = isScr ? "c" : "install";
 
         if (args.Length > 0)
         {
@@ -23,10 +27,17 @@ static class Program
             int colon = mode.IndexOf(':');
             if (colon >= 0) mode = mode[..colon];
             if (mode == "debug" || mode == "scene") mode = "s";
+            if (mode == "quiet") mode = isScr ? "c" : "install";
         }
 
         switch (mode)
         {
+            case "install":
+                Installer.Install(quiet);
+                break;
+            case "uninstall":
+                Installer.Uninstall(quiet);
+                break;
             case "s":
                 RunScreensaver(debug, forcedScene);
                 break;
@@ -82,12 +93,20 @@ static class Program
 
 static class Config
 {
-    // The scenes folder always lives next to the executable, so the package is self-contained and movable.
+    // The scenes folder lives next to the executable. Run from anywhere else (e.g. the setup exe with
+    // /debug), it falls back to the installed copy's scenes.
     public static string AppDir => Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory;
-    public static string ScenesDir => Path.Combine(AppDir, "scenes");
+    public static string ScenesDir
+    {
+        get
+        {
+            string local = Path.Combine(AppDir, "scenes");
+            return Directory.Exists(local) ? local : Path.Combine(Installer.InstallDir, "scenes");
+        }
+    }
 
     // Per-user writable data (WebView2 profile, last-used scene). The app folder may not be writable.
-    static string DataDir => Path.Combine(
+    public static string DataDir => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HtmlScreensaver");
     public static string UserDataDir => Path.Combine(DataDir, "WebView2");
     static string LastSceneFile => Path.Combine(DataDir, "last-scene.txt");

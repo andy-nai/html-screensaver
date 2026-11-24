@@ -88,6 +88,8 @@ const DEFAULTS = {
       hair:  ['#1e1a1a', '#4a3020', '#7a5030', '#c8a060', '#9a9aa0', '#8a3a20'],
     },
   },
+  clock: { show: true, hour12: false, seconds: false, position: 'auto', font: 'pixel', size: 1,
+    blinkColon: false, drift: true, glow: 1, colors: { text: '#8af4ff', glow: '#3bf0ff', box: '#161214' } },
 };
 
 // sections where config.js may add new named entries, not just change existing ones
@@ -1514,6 +1516,112 @@ function renderFg(ctx, scene, caches) {
 }
 
 /* ------------------------------------------------------------------
+ * Clock (settings in config.js under `clock`)
+ * ------------------------------------------------------------------ */
+const CLOCK_FONTS = {
+  pixel: { h: 7, g: {
+    '0': [' ### ', '#   #', '#  ##', '# # #', '##  #', '#   #', ' ### '],
+    '1': ['  #  ', ' ##  ', '  #  ', '  #  ', '  #  ', '  #  ', ' ### '],
+    '2': [' ### ', '#   #', '    #', '   # ', '  #  ', ' #   ', '#####'],
+    '3': ['#####', '   # ', '  #  ', '   # ', '    #', '#   #', ' ### '],
+    '4': ['   # ', '  ## ', ' # # ', '#  # ', '#####', '   # ', '   # '],
+    '5': ['#####', '#    ', '#### ', '    #', '    #', '#   #', ' ### '],
+    '6': ['  ## ', ' #   ', '#    ', '#### ', '#   #', '#   #', ' ### '],
+    '7': ['#####', '    #', '   # ', '  #  ', ' #   ', ' #   ', ' #   '],
+    '8': [' ### ', '#   #', '#   #', ' ### ', '#   #', '#   #', ' ### '],
+    '9': [' ### ', '#   #', '#   #', ' ####', '    #', '   # ', ' ##  '],
+    ':': [' ', ' ', '#', ' ', '#', ' ', ' '],
+  } },
+  small: { h: 5, g: {
+    '0': ['###', '# #', '# #', '# #', '###'], '1': [' # ', '## ', ' # ', ' # ', '###'],
+    '2': ['###', '  #', '###', '#  ', '###'], '3': ['###', '  #', '###', '  #', '###'],
+    '4': ['# #', '# #', '###', '  #', '  #'], '5': ['###', '#  ', '###', '  #', '###'],
+    '6': ['###', '#  ', '###', '# #', '###'], '7': ['###', '  #', '  #', '  #', '  #'],
+    '8': ['###', '# #', '###', '# #', '###'], '9': ['###', '# #', '###', '  #', '###'],
+    ':': [' ', '#', ' ', '#', ' '],
+    'A': ['###', '# #', '###', '# #', '# #'], 'P': ['###', '# #', '###', '#  ', '#  '], 'M': ['# #', '###', '###', '# #', '# #'],
+  } },
+};
+// LED digits: which segments each digit lights, and the cells of each segment in a 4×7 box
+const CLOCK_DIGITS = ['abcdef', 'bc', 'abged', 'abgcd', 'fgbc', 'afgcd', 'afgedc', 'abc', 'abcdefg', 'abcdfg'];
+const CLOCK_SEGMENTS = { a: [[1, 0], [2, 0]], b: [[3, 1], [3, 2]], c: [[3, 4], [3, 5]], d: [[1, 6], [2, 6]],
+  e: [[0, 4], [0, 5]], f: [[0, 1], [0, 2]], g: [[1, 3], [2, 3]] };
+
+// The current time as lists of lit (and, for LED digits, unlit) cells in font pixels
+function clockLayout(now) {
+  const C = CFG.clock, pad = n => String(n).padStart(2, '0');
+  let h = now.getHours(), suffix = '';
+  if (C.hour12) { suffix = h < 12 ? 'AM' : 'PM'; h = h % 12 || 12; }
+  const txt = (C.hour12 ? String(h) : pad(h)) + ':' + pad(now.getMinutes()) + (C.seconds ? ':' + pad(now.getSeconds()) : '');
+  const colonOn = !C.blinkColon || now.getMilliseconds() < 500;
+  const seg = C.font === 'segment', F = CLOCK_FONTS[C.font] || CLOCK_FONTS.pixel, fh = seg ? 7 : F.h;
+  const on = [], off = [];
+  const put = (rows, x0, y0, list) => rows.forEach((row, y) => {
+    for (let i = 0; i < row.length; i++) if (row[i] === '#') list.push([x0 + i, y0 + y]);
+  });
+  let x = 0;
+  for (const ch of txt) {
+    if (ch === ':') { put(seg ? CLOCK_FONTS.pixel.g[':'] : F.g[':'], x, 0, colonOn ? on : off); x += 2; }
+    else if (seg) {
+      const lit = CLOCK_DIGITS[+ch];
+      for (const [s, cells] of Object.entries(CLOCK_SEGMENTS)) for (const [cx, cy] of cells) (lit.includes(s) ? on : off).push([x + cx, cy]);
+      x += 5;
+    } else { put(F.g[ch], x, 0, on); x += F.g[ch][0].length + 1; }
+  }
+  if (suffix) {
+    const S = CLOCK_FONTS.small;
+    x += 1;
+    for (const ch of suffix) { put(S.g[ch], x, fh - S.h, on); x += 4; }
+  }
+  return { on, off, w: x - 1, h: fh };
+}
+
+// anchor: { x, y, align: 'left' | 'center' | 'right', valign: 'top' | 'bottom', scale, box } in art pixels;
+// unit = screen pixels per art pixel (1 when drawing into the art-sized buffer)
+function drawClock(g, anchor, unit = 1) {
+  const C = CFG.clock;
+  if (!C.show || !anchor) return;
+  const now = new Date(), L = clockLayout(now);
+  const s = Math.max(1, Math.round(C.size * (anchor.scale || 1)));
+  const w = L.w * s, h = L.h * s;
+  let x = anchor.align === 'right' ? anchor.x - w : anchor.align === 'center' ? anchor.x - Math.round(w / 2) : anchor.x;
+  let y = anchor.valign === 'bottom' ? anchor.y - h : anchor.y;
+  if (C.drift && !anchor.box) {              // wander a pixel or two each minute so it can't burn into the screen
+    const m = now.getHours() * 60 + now.getMinutes();
+    x += Math.round(Math.sin(m * .7) * 2 * s); y += Math.round(Math.cos(m * .45) * 1.5 * s);
+  }
+  const rect = (px, py, rw, rh) => g.fillRect((x + px) * unit, (y + py) * unit, rw * unit, rh * unit);
+  if (anchor.box) {                          // a little bedside-clock case
+    const p = 2 * s;
+    g.fillStyle = C.colors.box; rect(-p, -p, w + p * 2, h + p * 2);
+    g.fillStyle = 'rgba(255,255,255,.1)'; rect(-p, -p, w + p * 2, 1);
+    g.fillStyle = 'rgba(0,0,0,.45)'; rect(-p, h + p - 1, w + p * 2, 1);
+  }
+  if (C.glow > 0) {
+    g.globalAlpha = .16 * C.glow; g.fillStyle = C.colors.glow;
+    for (const [px, py] of L.on) rect(px * s - s, py * s - s, s * 3, s * 3);
+  }
+  g.fillStyle = C.colors.text;
+  if (L.off.length) { g.globalAlpha = .1; for (const [px, py] of L.off) rect(px * s, py * s, s, s); }
+  g.globalAlpha = 1;
+  for (const [px, py] of L.on) rect(px * s, py * s, s, s);
+}
+
+// A fixed clock position: a corner or the middle of the top or bottom edge
+function clockCorner(pos, W, H, margin) {
+  const top = !pos.startsWith('bottom');
+  const align = pos.endsWith('left') ? 'left' : pos.endsWith('right') ? 'right' : 'center';
+  return { x: align === 'left' ? margin : align === 'right' ? W - margin : Math.round(W / 2),
+    y: top ? margin : H - margin, align, valign: top ? 'top' : 'bottom' };
+}
+// The scene's own spot when position is 'auto', otherwise the chosen corner
+function clockAnchor(auto, W, H, k) {
+  const pos = CFG.clock.position;
+  const a = pos === 'auto' ? auto : clockCorner(pos, W, H, Math.round(8 * k));
+  return { ...a, scale: k, box: pos === 'auto' && auto.box };
+}
+
+/* ------------------------------------------------------------------
  * App: sizing, seed, resize, input
  * ------------------------------------------------------------------ */
 const canvas = document.getElementById('city');
@@ -1547,6 +1655,9 @@ function setup() {
 
   scene = generateScene(seed, W, H);
   scene.px = px;
+  // clock in the top corner away from the moon, glowing like a neon sign
+  const cm = Math.round(8 * H / 200), moonLeft = scene.moon.cx < W / 2;
+  scene.clock = clockAnchor({ x: moonLeft ? W - cm : cm, y: cm, align: moonLeft ? 'right' : 'left', valign: 'top' }, W, H, H / 200);
   caches = buildCaches(scene);
   history.replaceState(null, '', '#' + seed);
   draw(performance.now());
@@ -1567,6 +1678,7 @@ function draw(t) {
   drawCars(ctx, scene, px);
   ctx.drawImage(fgBuf, 0, 0, W * px, H * px);
   drawAbduction(ctx, scene, t, px);   // in front of everything
+  drawClock(ctx, scene.clock, px);
 }
 
 // Everything is animated from the clock, not frame counts, so drawing fewer
@@ -1597,8 +1709,9 @@ addEventListener('keydown', e => {
   if (k === 'c') { spawnCar(scene, performance.now()); if (!ANIMATE) draw(performance.now()); }
   if (k === 'p') { spawnPedestrian(scene, performance.now()); if (!ANIMATE) draw(performance.now()); }
   // U = a visit exactly like a natural one (same chance of ending in an abduction)
-  if (k === 'u' && !scene.ufo && !scene.abduction) { spawnUfo(scene, performance.now(), Math.random() < ABDUCT_CHANCE); if (!ANIMATE) draw(performance.now()); }
-  if (k === 'a') testAbduction();
+  // X = this scene's rare visitor (Shift+X = its variation, where it has one)
+  if (k === 'x' && e.shiftKey) testAbduction();
+  else if (k === 'x' && !scene.ufo && !scene.abduction) { spawnUfo(scene, performance.now(), Math.random() < ABDUCT_CHANCE); if (!ANIMATE) draw(performance.now()); }
 });
 
 // testing helper (A key): a UFO visit that's sure to end in an abduction —

@@ -9,6 +9,8 @@ row has, how often cars, pedestrians and shooting stars appear, how lively the w
 cap, and so on. Edit and restart the screensaver (or reload the page). Anything you delete falls back to the
 default built into the page.
 
+A 24-hour clock sits in the top corner away from the moon, glowing like a neon sign. The `clock` section of the config sets its position, font, size and colours, or hides it with `show: false`.
+
 Run `HtmlScreensaver-Setup.exe /debug /scene:cityscape-night` to try it full screen.
 
 When opened in a browser, the number after `#` in the address is the city's seed; keep it to see the same

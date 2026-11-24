@@ -160,4 +160,18 @@ window.CITYSCAPE_CONFIG = {
       hair:  ['#1e1a1a', '#4a3020', '#7a5030', '#c8a060', '#9a9aa0', '#8a3a20'],
     },
   },
+
+  clock: {
+    show: true,
+    hour12: false,            // true = 12-hour time with AM/PM
+    seconds: false,
+    position: 'auto',         // 'auto' = top corner away from the moon, like a neon sign;
+                              // or 'top-left', 'top', 'top-right', 'bottom-left', 'bottom', 'bottom-right'
+    font: 'pixel',            // 'pixel' (5×7), 'small' (3×5) or 'segment' (LED digits)
+    size: 1,                  // 2, 3… for a bigger clock
+    blinkColon: false,        // blink the ':' every second
+    drift: true,              // move a pixel or two each minute so it can't burn into the screen
+    glow: 1,                  // 0 = no glow
+    colors: { text: '#8af4ff', glow: '#3bf0ff' },
+  },
 };

@@ -1,0 +1,805 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aquarium</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0a2852; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; image-rendering: pixelated; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<!-- optional user settings; the page falls back to the defaults below if it's missing -->
+<script>
+  document.write('<script src="config.js?v=' + Date.now() + '"><\/script>');
+</script>
+<script>
+'use strict';
+
+/* ------------------------------------------------------------------
+ * Config — defaults, overridden by config.js (window.AQUARIUM_CONFIG)
+ * ------------------------------------------------------------------ */
+const DEFAULTS = {
+  display: { targetRows: 200, animate: true, frameRate: 24, seed: null, clickToRegenerate: true },
+  water: {
+    colors: {
+      gradient: ['#3cb4d0', '#2a96c0', '#1f78ac', '#185e94', '#13487c', '#0e3666', '#0a2852'],
+      surface: '#9ae4f2', haze: '#1d5f8e',
+    },
+  },
+  lightRays: { count: [4, 7], strength: 1, colors: { ray: '#c4f6ff' } },
+  seabed: {
+    caustics: 1,
+    colors: { sand: ['#d6c693', '#bcac7c', '#9a8c68'], rocks: ['#56687a', '#425264', '#334050'], caustics: '#effcff' },
+  },
+  plants: {
+    kelp: [3, 7], seagrass: [5, 10],
+    colors: { kelp: ['#6c7c2c', '#5a6a24', '#7c8c36'], kelpLeaf: '#90a040', seagrass: ['#3a8a4a', '#4aa05a', '#2e7a40'] },
+  },
+  coral: {
+    count: [6, 11],
+    colors: {
+      branching: ['#ff7a8a', '#ff9a5a', '#c86ad8', '#ffb0c0'], brain: ['#d8a05a', '#b8c86a', '#e88a6a'],
+      fan: ['#c84a8a', '#e86a5a', '#8a5ad8'], anemone: ['#ff9ad0', '#a8ffd8', '#ffd08a'],
+    },
+  },
+  fish: {
+    solo: [5, 9], schools: [1, 2], schoolSize: [10, 22],
+    species: { clown: 1, tang: 1, yellow: 1, sergeant: 1, grouper: .3 },
+    colors: {
+      clown:    { body: '#ff7a1a', stripe: '#ffffff', edge: '#1a1a1a' },
+      tang:     { body: '#2b5fd9', mark: '#101830', tail: '#ffd23a' },
+      yellow:   { body: '#ffd23a', belly: '#fff0a0' },
+      sergeant: { body: '#d8e070', belly: '#e8eef0', bar: '#20242c' },
+      grouper:  { body: '#8a6a4a', spot: '#5a4030', belly: '#b8946a' },
+      school:   { body: '#a8d0ec', stripe: '#3ab0ff', tail: '#ff4a6a' },
+    },
+  },
+  bubbles: { vents: [1, 3], everySeconds: .8, colors: { bubble: '#d8f6ff' } },
+  jellyfish: { everySeconds: 60, chance: .4, colors: ['#e8a8ff', '#ffb0d8', '#a8d8ff'] },
+  turtle: { everyMinutes: 5, chance: .5, colors: { shell: '#5e7c3c', pattern: '#3e5a2a', rim: '#c8b070', skin: '#9ab070' } },
+  particles: { density: 1, colors: { speck: '#cfefff' } },
+  clock: { show: true, hour12: false, seconds: false, position: 'auto', font: 'pixel', size: 1,
+    blinkColon: false, drift: true, glow: 0.6, colors: { text: '#e0fcff', glow: '#7ae8ff', box: '#161214' } },
+};
+
+function mergeConfig(base, over, path = '') {
+  const out = { ...base };
+  for (const k of Object.keys(over || {})) {
+    const b = base[k], o = over[k], p = path ? `${path}.${k}` : k;
+    if (o === undefined) continue;
+    if (!(k in base)) { console.warn(`config.js: unknown setting "${p}" ignored`); continue; }
+    const isGroup = v => v && typeof v === 'object' && !Array.isArray(v);
+    out[k] = isGroup(b) && isGroup(o) ? mergeConfig(b, o, p) : o;
+  }
+  return out;
+}
+const CFG = mergeConfig(DEFAULTS, window.AQUARIUM_CONFIG);
+const FRAME_INTERVAL = CFG.display.frameRate > 0 ? 1000 / CFG.display.frameRate : 0;
+
+/* ------------------------------------------------------------------
+ * Helpers: RNG, colour, dithering, noise
+ * ------------------------------------------------------------------ */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function makeRng(seed) {
+  const r = mulberry32(seed >>> 0);
+  return {
+    next: r,
+    range: (a, b) => a + r() * (b - a),
+    int: (a, b) => Math.floor(a + r() * (b - a + 1)),
+    pick: arr => arr[Math.floor(r() * arr.length)],
+    chance: p => r() < p,
+  };
+}
+const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const css = c => `rgb(${c[0] | 0},${c[1] | 0},${c[2] | 0})`;
+const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const mixHex = (a, b, t) => css(mix(hexRgb(a), hexRgb(b), t));
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + .5) / 16);
+const TAU = Math.PI * 2;
+const rint = ([a, b], rng = Math) => Math.floor(a + rng.random() * (b - a + 1));
+
+function makeCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+function flipped(src) {
+  const c = makeCanvas(src.width, src.height), g = c.getContext('2d');
+  g.translate(src.width, 0); g.scale(-1, 1); g.drawImage(src, 0, 0);
+  return c;
+}
+function ditherAt(stops, f, x, y) {
+  const n = stops.length - 1;
+  if (!n) return stops[0];
+  const v = clamp(f, 0, 1) * n, i = Math.min(n - 1, Math.floor(v));
+  return v - i > BAYER[(y & 3) * 4 + (x & 3)] ? stops[i + 1] : stops[i];
+}
+function putPixel(d, W, x, y, c) {
+  if (x < 0 || y < 0 || x >= W) return;
+  const o = (y * W + x) * 4;
+  d[o] = c[0]; d[o + 1] = c[1]; d[o + 2] = c[2]; d[o + 3] = 255;
+}
+function makeNoise(rng) {
+  const v = Array.from({ length: 256 }, () => rng.next());
+  const at = x => {
+    const i = Math.floor(x), f = x - i, s = (1 - Math.cos(f * Math.PI)) / 2;
+    return v[i & 255] * (1 - s) + v[(i + 1) & 255] * s;
+  };
+  return (x, oct = 3) => {
+    let sum = 0, amp = 1, tot = 0;
+    for (let o = 0; o < oct; o++) { sum += at(x * 2 ** o + o * 37) * amp; tot += amp; amp /= 2; }
+    return sum / tot;
+  };
+}
+// weighted pick from { name: weight }
+function pickWeighted(weights, r = Math.random()) {
+  const entries = Object.entries(weights).filter(([, w]) => w > 0);
+  let total = entries.reduce((s, [, w]) => s + w, 0), x = r * total;
+  for (const [name, w] of entries) { if ((x -= w) < 0) return name; }
+  return entries.length ? entries[0][0] : 'clown';
+}
+
+/* ------------------------------------------------------------------
+ * Fish and turtle sprites (drawn at 1 art pixel, scaled when drawn)
+ * ------------------------------------------------------------------ */
+const FISH_SIZE = { clown: [9, 5], tang: [11, 7], yellow: [9, 8], sergeant: [11, 6], grouper: [24, 11], school: [5, 3] };
+
+function makeFishSprites(species) {
+  const C = CFG.fish.colors[species] || CFG.fish.colors.clown;
+  const [L, h] = FISH_SIZE[species];
+  const tail = Math.max(2, Math.round(L * .3)), tailH = Math.max(2, Math.round(h * .85));
+  const w = L + tail, H = h + 2, cy = 1 + (h - 1) / 2;
+  const dark = c => mixHex(c, '#000000', .25), light = c => mixHex(c, '#ffffff', .2);
+  const bodyColor = (u, vy, x, y) => {
+    switch (species) {
+      case 'clown': {
+        const d = Math.min(...[.25, .58, .86].map(c => Math.abs(u - c)));
+        return d < .05 ? C.stripe : d < .1 ? C.edge : C.body;
+      }
+      case 'tang': return vy < -.05 && vy > -.75 && u > .25 && u < .72 ? C.mark : C.body;
+      case 'yellow': return vy > .35 ? C.belly : C.body;
+      case 'sergeant': return [.2, .42, .64].some(c => Math.abs(u - c) < .045) ? C.bar : vy > .2 ? C.belly : C.body;
+      case 'grouper': return ((x * 7 + y * 13) % 9 === 0) ? C.spot : vy > .45 ? C.belly : C.body;
+      default: return Math.abs(vy) < .3 && u > .15 ? C.stripe : C.body;
+    }
+  };
+  const tailColor = species === 'tang' ? C.tail : species === 'school' ? C.tail : species === 'clown' ? C.body : dark(C.body);
+  const frames = [0, 1].map(frame => {
+    const c = makeCanvas(w, H), g = c.getContext('2d');
+    // tail (left), forked, flicking between frames
+    for (let x = 0; x < tail; x++) {
+      const v = (tail - x) / tail, half = .6 + v * tailH / 2, dy = frame ? Math.round(v * 1.2) : 0;
+      for (let y = Math.ceil(cy - half); y <= Math.floor(cy + half); y++) {
+        if (v > .6 && Math.abs(y - cy) < half * .35) continue;
+        g.fillStyle = species === 'clown' && x === 0 ? C.edge : tailColor;
+        g.fillRect(x, y + dy, 1, 1);
+      }
+    }
+    // body, blunt at the nose
+    for (let x = 0; x < L; x++) {
+      const u = x / (L - 1), half = (h / 2) * Math.pow(Math.sin(Math.PI * clamp(.1 + u * .86, 0, 1)), .55);
+      for (let y = Math.ceil(cy - half); y <= Math.floor(cy + half); y++) {
+        const vy = (y - cy) / Math.max(.5, half);
+        let col = bodyColor(u, vy, x, y);
+        if (vy < -.7) col = dark(col); else if (vy > .75 && species !== 'clown') col = light(col);
+        g.fillStyle = col; g.fillRect(tail + x, y, 1, 1);
+      }
+    }
+    // dorsal fin and eye
+    g.fillStyle = species === 'clown' ? C.edge : dark(C.body);
+    if (L > 6) for (let x = Math.round(L * .35); x < Math.round(L * .65); x++) g.fillRect(tail + x, Math.floor(cy - h / 2) - (x % 2), 1, 1);
+    g.fillStyle = '#0a0a10'; g.fillRect(tail + Math.round(L * .78), Math.round(cy - h * .15), 1, 1);
+    return c;
+  });
+  return { w, h: H, right: frames, left: frames.map(flipped) };
+}
+
+function makeTurtleSprites() {
+  const T = CFG.turtle.colors, w = 28, H = 15;
+  return [0, 1].map(frame => {
+    const c = makeCanvas(w, H), g = c.getContext('2d');
+    const px = (x, y, col) => { g.fillStyle = col; g.fillRect(x, y, 1, 1); };
+    // flippers behind the shell
+    const front = frame ? [[18, 10], [19, 11], [20, 12], [21, 12], [22, 13], [19, 10], [20, 11], [21, 11]]
+                        : [[16, 10], [15, 11], [14, 12], [13, 13], [12, 13], [16, 11], [15, 12], [14, 13]];
+    const rear = frame ? [[5, 10], [4, 11], [3, 11]] : [[5, 10], [4, 10], [3, 9]];
+    for (const [x, y] of [...front, ...rear]) px(x, y, T.skin);
+    // shell
+    const sx = 12, sy = 7, rx = 10, ry = 6;
+    for (let y = sy - ry; y <= sy + 3; y++) for (let x = sx - rx; x <= sx + rx; x++) {
+      const d = ((x - sx) / rx) ** 2 + ((y - sy) / ry) ** 2;
+      if (d > 1) continue;
+      const edge = y === sy + 3 || d > .78;
+      const plate = (x % 5 === 0 && y < sy + 2) || y === sy - 3 || y === sy;
+      px(x, y, edge ? T.rim : plate ? T.pattern : T.shell);
+    }
+    // head and tail
+    for (const [x, y] of [[22, 7], [23, 7], [22, 8], [23, 6], [24, 6], [25, 6], [24, 7], [25, 7], [26, 7], [24, 8], [25, 8]]) px(x, y, T.skin);
+    px(25, 6, '#101810'); px(1, 8, T.skin); px(2, 8, T.skin);
+    return { right: c, left: flipped(c) };
+  });
+}
+
+/* ------------------------------------------------------------------
+ * Scene generation
+ * ------------------------------------------------------------------ */
+function generateScene(seed, W, H) {
+  const rng = makeRng(seed), noise = makeNoise(rng);
+  const rr = ([a, b]) => rng.int(a, b);
+  const k = H / 200, ps = Math.max(1, Math.round(k));
+  const S = { seed, W, H, k, ps, fish: [], jellies: [], turtles: [], bubbles: [], lastRoll: { jelly: 0, turtle: 0 } };
+  const WC = CFG.water.colors, haze = hexRgb(WC.haze);
+  const waterStops = WC.gradient.map(hexRgb);
+
+  // water
+  const bg = makeCanvas(W, H), bgx = bg.getContext('2d'), bi = bgx.createImageData(W, H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) putPixel(bi.data, W, x, y, ditherAt(waterStops, y / H, x, y));
+  bgx.putImageData(bi, 0, 0);
+  // distant rocks, hazy
+  // two layers: the farther one paler and higher
+  for (const [lvl, amt, fade] of [[.56, 45, .15], [.68, 30, .4]]) {
+    for (let x = 0; x < W; x++) {
+      const spire = (1 - Math.abs(2 * noise(x * .018 + lvl * 50) - 1)) ** 2.5;
+      const top = Math.round(H * (lvl + .08 * noise(x * .01 + lvl * 9)) - spire * amt * k);
+      bgx.fillStyle = css(mix(haze, waterStops.at(-1), fade)); bgx.fillRect(x, top, 1, H - top);
+      bgx.fillStyle = css(mix(mix(haze, waterStops.at(-1), fade), [200, 240, 255], .1)); bgx.fillRect(x, top, 1, 1);
+    }
+  }
+  S.bg = bg;
+
+  S.rays = Array.from({ length: rr(CFG.lightRays.count) }, () => ({
+    x: rng.range(-.1, 1) * W, w: rng.range(6, 18) * k, slope: rng.range(.15, .35), a: rng.range(.07, .14),
+    ph: rng.range(0, TAU), sp: rng.range(.0002, .0005),
+  }));
+
+  // seabed
+  const sandY = Array.from({ length: W }, (_, x) =>
+    Math.round(H * .84 + (noise(x * .01 + 30) - .5) * 12 * k + (noise(x * .06 + 60) - .5) * 3 * k));
+  S.sandY = sandY;
+  const floor = makeCanvas(W, H), fx = floor.getContext('2d'), fi = fx.createImageData(W, H);
+  const sandStops = CFG.seabed.colors.sand.map(c => mix(hexRgb(c), waterStops.at(-1), .22));
+  for (let x = 0; x < W; x++) for (let y = sandY[x]; y < H; y++) putPixel(fi.data, W, x, y, ditherAt(sandStops, (y - sandY[x]) / (H - sandY[x]) * 1.3, x, y));
+  fx.putImageData(fi, 0, 0);
+
+  // things on the seabed, back to front
+  const items = [];
+  for (let i = rng.int(2, 4); i > 0; i--) items.push({ kind: 'rock', x: rng.int(0, W) });
+  for (let i = rr(CFG.coral.count); i > 0; i--) items.push({ kind: rng.pick(['branching', 'branching', 'brain', 'fan', 'anemone']), x: rng.int(0, W) });
+  const anemones = [];
+  for (const it of items) {
+    const x = it.x, y = sandY[clamp(x, 0, W - 1)] + rng.int(1, 4);
+    if (it.kind === 'rock') drawRock(fx, rng, x, y, rng.range(8, 20) * k, rng.range(5, 12) * k);
+    else if (it.kind === 'branching') drawBranch(fx, rng, x, y, -Math.PI / 2, rng.range(6, 11) * k, 4, rng.pick(CFG.coral.colors.branching));
+    else if (it.kind === 'brain') drawBrain(fx, rng, x, y, rng.range(5, 10) * k, rng.range(4, 7) * k, rng.pick(CFG.coral.colors.brain));
+    else if (it.kind === 'fan') drawFan(fx, rng, x, y, rng.range(10, 18) * k, rng.pick(CFG.coral.colors.fan));
+    else {
+      const col = rng.pick(CFG.coral.colors.anemone), r = Math.max(2, Math.round(rng.range(2, 4) * k));
+      fx.fillStyle = mixHex(col, '#402040', .55); fx.fillRect(x - r, y - r, r * 2 + 1, r + 1);
+      anemones.push({ x, y: y - r, col, n: 7 + rng.int(0, 4), len: rng.range(4, 7) * k, ph: rng.range(0, TAU) });
+    }
+  }
+  S.floor = floor; S.anemones = anemones;
+
+  // plants
+  const KC = CFG.plants.colors;
+  S.kelp = Array.from({ length: rr(CFG.plants.kelp) }, () => {
+    const x = rng.int(0, W - 1), back = rng.chance(.5);
+    const col = rng.pick(KC.kelp);
+    return { x, y: sandY[x] + 2, len: Math.round(H * rng.range(.45, .8) * (back ? .85 : 1)), ph: rng.range(0, TAU),
+      lean: rng.range(-.04, .04), back,
+      col: back ? css(mix(hexRgb(col), haze, .45)) : col, leaf: back ? css(mix(hexRgb(KC.kelpLeaf), haze, .45)) : KC.kelpLeaf,
+      w: Math.max(1, Math.round(k * (back ? 1 : 1.5))) };
+  }).sort((a, b) => b.back - a.back);
+  S.grass = Array.from({ length: rr(CFG.plants.seagrass) }, () => {
+    const x = rng.int(0, W - 1);
+    return { x, y: sandY[x] + 2, blades: Array.from({ length: rng.int(4, 8) }, () => ({
+      dx: rng.int(-3, 3) * k, len: rng.range(6, 16) * k, ph: rng.range(0, TAU), col: rng.pick(KC.seagrass) })) };
+  });
+
+  // bubble vents
+  S.vents = Array.from({ length: rr(CFG.bubbles.vents) }, () => {
+    const x = rng.int(Math.round(W * .05), Math.round(W * .95));
+    return { x, y: sandY[x], last: 0, gap: CFG.bubbles.everySeconds * 1000 * rng.range(.6, 1.4) };
+  });
+
+  // drifting specks: position is a function of time
+  S.specks = Array.from({ length: Math.round(W * H / 400 * CFG.particles.density) }, () => ({
+    x0: rng.range(0, W), y0: rng.range(0, H), v: rng.range(.6, 2) * k, sway: rng.range(1, 4) * k,
+    ph: rng.range(0, TAU), sp: rng.range(.0002, .0006), a: rng.range(.15, .45),
+  }));
+
+  // fish
+  S.sprites = {};
+  for (const sp of Object.keys(FISH_SIZE)) S.sprites[sp] = makeFishSprites(sp);
+  S.turtleSprites = makeTurtleSprites();
+  S.soloTarget = rr(CFG.fish.solo);
+  for (let i = 0; i < S.soloTarget; i++) spawnFish(S, performance.now(), true, rng);
+  S.schools = [];
+  for (let i = rr(CFG.fish.schools); i > 0; i--) addSchool(S, rng);
+  // clock just under the surface, top right
+  S.clock = clockAnchor({ x: W - Math.round(8 * k), y: Math.round(14 * k), align: 'right', valign: 'top' }, W, H, k);
+  return S;
+}
+
+function drawRock(g, rng, x, y, rx, ry) {
+  const R = CFG.seabed.colors.rocks;
+  for (let dy = -ry; dy <= 2; dy++) for (let dx = -rx; dx <= rx; dx++) {
+    const d = (dx / rx) ** 2 + (dy / ry) ** 2;
+    if (d > 1 + BAYER[((dy | 0) & 3) * 4 + ((dx | 0) & 3)] * .15) continue;
+    const light = dx / rx + dy / ry;
+    g.fillStyle = light < -.5 ? R[0] : light > .45 ? R[2] : R[1];
+    g.fillRect(Math.round(x + dx), Math.round(y + dy), 1, 1);
+  }
+}
+function drawBranch(g, rng, x, y, ang, len, depth, col) {
+  const tip = mixHex(col, '#ffffff', .35);
+  for (let i = 0; i < len; i++) {
+    x += Math.cos(ang); y += Math.sin(ang);
+    g.fillStyle = depth === 0 && i > len - 2 ? tip : col;
+    g.fillRect(Math.round(x), Math.round(y), 1, 1);
+    if (depth > 2) g.fillRect(Math.round(x) + 1, Math.round(y), 1, 1);
+  }
+  if (depth > 0) for (const s of [-1, 1]) drawBranch(g, rng, x, y, ang + s * rng.range(.3, .65), len * rng.range(.6, .85), depth - 1, col);
+}
+function drawBrain(g, rng, x, y, rx, ry, col) {
+  const dark = mixHex(col, '#000000', .3), lite = mixHex(col, '#ffffff', .2);
+  for (let dy = -ry; dy <= 0; dy++) for (let dx = -rx; dx <= rx; dx++) {
+    if ((dx / rx) ** 2 + (dy / ry) ** 2 > 1) continue;
+    const groove = Math.sin(dx * 1.3 + Math.sin(dy * 1.1) * 2) > .55;
+    g.fillStyle = groove ? dark : dy < -ry * .6 ? lite : col;
+    g.fillRect(Math.round(x + dx), Math.round(y + dy), 1, 1);
+  }
+}
+function drawFan(g, rng, x, y, r, col) {
+  const dark = mixHex(col, '#000000', .3);
+  for (let dy = -r; dy <= 0; dy++) for (let dx = -r; dx <= r; dx++) {
+    const d = Math.hypot(dx, dy), a = Math.atan2(dx, -dy);
+    if (d > r || d < 2 || Math.abs(a) > 1.05) continue;
+    const vein = Math.round(a * 6) === a * 6 || Math.abs(a * 6 - Math.round(a * 6)) < .12;
+    const ring = Math.round(d) % 3 === 0;
+    if (!(vein || ring)) continue;
+    g.fillStyle = vein ? col : dark; g.fillRect(Math.round(x + dx), Math.round(y + dy), 1, 1);
+  }
+  g.fillStyle = dark; g.fillRect(Math.round(x), Math.round(y) - 2, 1, 3);
+}
+
+/* ------------------------------------------------------------------
+ * Swimmers
+ * ------------------------------------------------------------------ */
+function spawnFish(S, t, anywhere, rng) {
+  const R = rng ? rng.next : Math.random;
+  const species = pickWeighted(CFG.fish.species, R());
+  const sp = S.sprites[species], right = R() < .5, depth = .55 + R() * .45;
+  const speed = (species === 'grouper' ? 3 : 5 + R() * 6) * S.k / 1000;
+  const top = S.H * .1, bottom = S.H * .78 - sp.h * S.ps;
+  S.fish.push({
+    species, sp, right, depth,
+    x: anywhere ? R() * S.W : right ? -sp.w * S.ps - 2 : S.W + 2,
+    y: top + R() * (bottom - top), vx: right ? speed : -speed,
+    bobA: (1 + R() * 3) * S.k, bobPh: R() * TAU, bobSp: .0006 + R() * .0008, flapMs: 180 + R() * 160,
+    turnAt: t + 20000 + R() * 60000,
+  });
+  S.fish.sort((a, b) => a.depth - b.depth);
+}
+
+function addSchool(S, rng) {
+  const R = rng ? rng.next : Math.random;
+  const n = Math.round(CFG.fish.schoolSize[0] + R() * (CFG.fish.schoolSize[1] - CFG.fish.schoolSize[0]));
+  S.schools.push({
+    a: TAU / (50000 + R() * 40000), b: TAU / (25000 + R() * 30000), p: R() * TAU, q: R() * TAU, cy: .3 + R() * .3,
+    members: Array.from({ length: n }, () => {
+      const ang = R() * TAU, rad = Math.sqrt(R());
+      return { ox: Math.cos(ang) * rad * 16 * S.k, oy: Math.sin(ang) * rad * 7 * S.k, lag: R() * 1800, ph: R() * TAU };
+    }),
+  });
+}
+
+function spawnJelly(S, t) {
+  const r = (4 + Math.random() * 3) * S.k;
+  S.jellies.push({ x: S.W * (.1 + Math.random() * .8), y: S.H * (.75 + Math.random() * .15), r, born: t,
+    pulseMs: 2600 + Math.random() * 1200, vx: (Math.random() - .5) * 1.5 * S.k / 1000,
+    col: CFG.jellyfish.colors[Math.floor(Math.random() * CFG.jellyfish.colors.length)], n: 5 });
+}
+function spawnTurtle(S, t) {
+  const right = Math.random() < .5, w = 28 * S.ps;
+  S.turtles.push({ right, x: right ? -w - 2 : S.W + 2, y: S.H * (.25 + Math.random() * .35), vx: (right ? 1 : -1) * 4 * S.k / 1000, ph: Math.random() * TAU });
+}
+function burst(S, t) {
+  const v = S.vents[Math.floor(Math.random() * S.vents.length)];
+  if (!v) return;
+  for (let i = 0; i < 12; i++) addBubble(S, v, t + i * 90);
+}
+function addBubble(S, v, t) {
+  S.bubbles.push({ x0: v.x + (Math.random() - .5) * 3 * S.k, y0: v.y - 1, born: t,
+    v: (12 + Math.random() * 8) * S.k / 1000, r: Math.random() < .3 ? 2 : 1, ph: Math.random() * TAU });
+}
+
+/* ------------------------------------------------------------------
+ * Drawing
+ * ------------------------------------------------------------------ */
+function render(b, S, t) {
+  const { W, H, k, ps } = S;
+  b.imageSmoothingEnabled = false;
+  b.drawImage(S.bg, 0, 0);
+
+  // light rays from the surface
+  if (CFG.lightRays.strength > 0) {
+    const bottom = H * .88;
+    for (const r of S.rays) {
+      const x0 = r.x + Math.sin(t * .00015 + r.ph) * 10 * k;
+      const a = r.a * CFG.lightRays.strength * (.55 + .45 * Math.sin(t * r.sp + r.ph));
+      const g = b.createLinearGradient(0, 0, 0, bottom);
+      g.addColorStop(0, CFG.lightRays.colors.ray); g.addColorStop(1, 'rgba(196,246,255,0)');
+      b.globalAlpha = a; b.fillStyle = g;
+      b.beginPath(); b.moveTo(x0, 0); b.lineTo(x0 + r.w, 0);
+      b.lineTo(x0 + r.w * 1.8 + r.slope * bottom, bottom); b.lineTo(x0 + r.slope * bottom, bottom); b.fill();
+    }
+    b.globalAlpha = 1;
+  }
+
+  for (const kp of S.kelp) if (kp.back) drawKelp(b, S, kp, t);
+  drawSchools(b, S, t, true);
+  b.drawImage(S.floor, 0, 0);
+
+  // caustics rippling over the sand
+  const cs = CFG.seabed.caustics;
+  if (cs > 0) {
+    b.fillStyle = CFG.seabed.colors.caustics;
+    for (let x = 0; x < W; x++) for (let y = S.sandY[x]; y < H; y++) {
+      const c = Math.sin(x * .23 + t * .0011) + Math.sin(y * .41 - t * .0013 + x * .05) + Math.sin((x - y) * .17 + t * .0008);
+      if (c < 2) continue;
+      b.globalAlpha = Math.min(1, (c - 2) / .8) * .45 * cs; b.fillRect(x, y, 1, 1);
+    }
+    b.globalAlpha = 1;
+  }
+
+  // seagrass and anemones
+  for (const cl of S.grass) for (const bl of cl.blades) {
+    b.fillStyle = bl.col;
+    for (let s = 0; s < bl.len; s++) {
+      const f = s / bl.len, x = cl.x + bl.dx + Math.sin(t * .0012 + bl.ph + s * .15) * f ** 1.5 * 2.5 * k;
+      b.fillRect(Math.round(x), cl.y - s, 1, 1);
+    }
+  }
+  for (const an of S.anemones) {
+    const tip = mixHex(an.col, '#ffffff', .4);
+    for (let i = 0; i < an.n; i++) {
+      const ang = (i / (an.n - 1) - .5) * 2.2;
+      for (let s = 0; s < an.len; s++) {
+        const x = an.x + Math.sin(ang) * s + Math.sin(t * .0018 + an.ph + i + s * .3) * s * .18;
+        const y = an.y - Math.cos(ang) * s * .9;
+        b.fillStyle = s > an.len - 2 ? tip : an.col; b.fillRect(Math.round(x), Math.round(y), 1, 1);
+      }
+    }
+  }
+
+  // solo fish, far first
+  for (const f of S.fish) {
+    const sp = f.sp, frame = Math.floor(t / f.flapMs) % 2;
+    const img = (f.right ? sp.right : sp.left)[frame];
+    const y = f.y + Math.sin(t * f.bobSp + f.bobPh) * f.bobA;
+    b.globalAlpha = f.depth;
+    b.drawImage(img, Math.round(f.x), Math.round(y), sp.w * ps, sp.h * ps);
+  }
+  b.globalAlpha = 1;
+  drawSchools(b, S, t, false);
+
+  for (const tt of S.turtles) {
+    const frame = Math.floor(t / 900 + tt.ph) % 2, sp = S.turtleSprites[frame];
+    const y = tt.y + Math.sin(t * .0005 + tt.ph) * 3 * k;
+    b.drawImage(tt.right ? sp.right : sp.left, Math.round(tt.x), Math.round(y), 28 * ps, 15 * ps);
+  }
+  for (const j of S.jellies) drawJelly(b, S, j, t);
+
+  for (const kp of S.kelp) if (!kp.back) drawKelp(b, S, kp, t);
+
+  // bubbles
+  const surfY = 4 * k;
+  S.bubbles = S.bubbles.filter(bb => t < bb.born || bb.y0 - (t - bb.born) * bb.v > surfY);
+  for (const bb of S.bubbles) {
+    if (t < bb.born) continue;
+    const age = t - bb.born, y = Math.round(bb.y0 - age * bb.v), x = Math.round(bb.x0 + Math.sin(age * .004 + bb.ph) * 1.5 * k);
+    const r = Math.round(bb.r * k * (1 + age * .00004));
+    b.fillStyle = CFG.bubbles.colors.bubble;
+    if (r <= 1) { b.globalAlpha = .8; b.fillRect(x, y, Math.max(1, ps), Math.max(1, ps)); }
+    else {
+      b.globalAlpha = .65;
+      b.fillRect(x - r + 1, y - r, r * 2 - 1, 1); b.fillRect(x - r + 1, y + r, r * 2 - 1, 1);
+      b.fillRect(x - r, y - r + 1, 1, r * 2 - 1); b.fillRect(x + r, y - r + 1, 1, r * 2 - 1);
+      b.globalAlpha = .95; b.fillStyle = '#ffffff'; b.fillRect(x - r + 1, y - r + 1, 1, 1);
+    }
+  }
+  b.globalAlpha = 1;
+
+  // drifting specks
+  b.fillStyle = CFG.particles.colors.speck;
+  for (const s of S.specks) {
+    const secs = t / 1000;
+    const y = ((s.y0 + s.v * secs) % H + H) % H, x = ((s.x0 + Math.sin(t * s.sp + s.ph) * s.sway) % W + W) % W;
+    b.globalAlpha = s.a; b.fillRect(Math.round(x), Math.round(y), 1, 1);
+  }
+  b.globalAlpha = 1;
+
+  drawClock(b, S.clock);
+
+  // the surface, rippling
+  const SC = CFG.water.colors.surface;
+  for (let x = 0; x < W; x++) {
+    const y = Math.round(surfY + Math.sin(x * .07 + t * .0012) * 1.2 * k + Math.sin(x * .023 - t * .0007) * k);
+    b.globalAlpha = .3; b.fillStyle = SC; b.fillRect(x, 0, 1, y);
+    b.globalAlpha = .75; b.fillRect(x, y, 1, 1);
+    if (Math.sin(x * .5 + t * .003) > .93) { b.globalAlpha = .9; b.fillStyle = '#ffffff'; b.fillRect(x, y - 1, 1, 1); }
+  }
+  b.globalAlpha = 1;
+}
+
+function drawKelp(b, S, kp, t) {
+  const k = S.k, amp = 9 * k;
+  for (let s = 0; s < kp.len; s++) {
+    const f = s / kp.len;
+    const x = kp.x + Math.sin(t * .0006 + kp.ph - s * .035) * f ** 1.3 * amp + kp.lean * s;
+    const y = kp.y - s;
+    b.fillStyle = kp.col; b.fillRect(Math.round(x), y, kp.w, 1);
+    const step = Math.round(5 * k);
+    if (s > 4 * k && s % step === 0) {
+      const side = (s / step) % 2 ? 1 : -1, len = Math.round((3 + 3 * Math.sin(s * .7 + kp.ph) ** 2) * k);
+      b.fillStyle = kp.leaf;
+      const lx = side > 0 ? Math.round(x) + kp.w : Math.round(x) - len;
+      b.fillRect(lx, y, len, 1);
+      b.fillRect(side > 0 ? lx + 1 : lx, y + 1, len - 1, 1);
+    }
+  }
+}
+
+function drawSchools(b, S, t, behind) {
+  const sp = S.sprites.school, { W, H, ps } = S;
+  S.schools.forEach((sc, i) => {
+    if ((i % 2 === 0) !== behind) return;          // alternate schools behind and in front of the reef
+    for (const m of sc.members) {
+      const tt = t - m.lag;
+      const cx = W * (.5 + .55 * Math.sin(tt * sc.a + sc.p)), cy = H * (sc.cy + .15 * Math.sin(tt * sc.b + sc.q));
+      const dir = Math.cos(tt * sc.a + sc.p) >= 0;
+      const x = cx + m.ox + Math.sin(t * .002 + m.ph) * 1.5 * S.k, y = cy + m.oy + Math.sin(t * .0016 + m.ph * 2) * S.k;
+      const frame = Math.floor(t / 140 + m.ph) % 2;
+      b.globalAlpha = behind ? .7 : 1;
+      b.drawImage((dir ? sp.right : sp.left)[frame], Math.round(x), Math.round(y), sp.w * ps, sp.h * ps);
+    }
+  });
+  b.globalAlpha = 1;
+}
+
+function drawJelly(b, S, j, t) {
+  const p = ((t - j.born) / j.pulseMs) % 1, c = p < .25 ? Math.sin(p / .25 * Math.PI) : 0;
+  const rx = j.r * (1 - .18 * c), ry = j.r * .8 * (1 + .12 * c), x = j.x, y = j.y;
+  b.fillStyle = j.col;
+  for (let s = 0; s < j.n; s++) {                   // tentacles
+    const bx = x + (s - (j.n - 1) / 2) * rx * .38;
+    for (let i = 0; i < j.r * 2.4; i++) {
+      b.globalAlpha = .45 * (1 - i / (j.r * 2.4));
+      b.fillRect(Math.round(bx + Math.sin(t * .003 + s + i * .35) * i * .12), Math.round(y + 1 + i), 1, 1);
+    }
+  }
+  for (let dy = -ry; dy <= 0; dy++) {               // bell
+    const half = rx * Math.sqrt(Math.max(0, 1 - (dy / ry) ** 2));
+    b.globalAlpha = dy > -1.5 ? .8 : .5;
+    b.fillRect(Math.round(x - half), Math.round(y + dy), Math.round(half * 2) + 1, 1);
+  }
+  b.globalAlpha = .9; b.fillStyle = mixHex(j.col, '#ffffff', .5);
+  b.fillRect(Math.round(x - rx * .3), Math.round(y - ry * .5), Math.max(1, Math.round(rx * .25)), 1);
+  b.globalAlpha = 1;
+}
+
+/* ------------------------------------------------------------------
+ * Clock (settings in config.js under `clock`)
+ * ------------------------------------------------------------------ */
+const CLOCK_FONTS = {
+  pixel: { h: 7, g: {
+    '0': [' ### ', '#   #', '#  ##', '# # #', '##  #', '#   #', ' ### '],
+    '1': ['  #  ', ' ##  ', '  #  ', '  #  ', '  #  ', '  #  ', ' ### '],
+    '2': [' ### ', '#   #', '    #', '   # ', '  #  ', ' #   ', '#####'],
+    '3': ['#####', '   # ', '  #  ', '   # ', '    #', '#   #', ' ### '],
+    '4': ['   # ', '  ## ', ' # # ', '#  # ', '#####', '   # ', '   # '],
+    '5': ['#####', '#    ', '#### ', '    #', '    #', '#   #', ' ### '],
+    '6': ['  ## ', ' #   ', '#    ', '#### ', '#   #', '#   #', ' ### '],
+    '7': ['#####', '    #', '   # ', '  #  ', ' #   ', ' #   ', ' #   '],
+    '8': [' ### ', '#   #', '#   #', ' ### ', '#   #', '#   #', ' ### '],
+    '9': [' ### ', '#   #', '#   #', ' ####', '    #', '   # ', ' ##  '],
+    ':': [' ', ' ', '#', ' ', '#', ' ', ' '],
+  } },
+  small: { h: 5, g: {
+    '0': ['###', '# #', '# #', '# #', '###'], '1': [' # ', '## ', ' # ', ' # ', '###'],
+    '2': ['###', '  #', '###', '#  ', '###'], '3': ['###', '  #', '###', '  #', '###'],
+    '4': ['# #', '# #', '###', '  #', '  #'], '5': ['###', '#  ', '###', '  #', '###'],
+    '6': ['###', '#  ', '###', '# #', '###'], '7': ['###', '  #', '  #', '  #', '  #'],
+    '8': ['###', '# #', '###', '# #', '###'], '9': ['###', '# #', '###', '  #', '###'],
+    ':': [' ', '#', ' ', '#', ' '],
+    'A': ['###', '# #', '###', '# #', '# #'], 'P': ['###', '# #', '###', '#  ', '#  '], 'M': ['# #', '###', '###', '# #', '# #'],
+  } },
+};
+// LED digits: which segments each digit lights, and the cells of each segment in a 4×7 box
+const CLOCK_DIGITS = ['abcdef', 'bc', 'abged', 'abgcd', 'fgbc', 'afgcd', 'afgedc', 'abc', 'abcdefg', 'abcdfg'];
+const CLOCK_SEGMENTS = { a: [[1, 0], [2, 0]], b: [[3, 1], [3, 2]], c: [[3, 4], [3, 5]], d: [[1, 6], [2, 6]],
+  e: [[0, 4], [0, 5]], f: [[0, 1], [0, 2]], g: [[1, 3], [2, 3]] };
+
+// The current time as lists of lit (and, for LED digits, unlit) cells in font pixels
+function clockLayout(now) {
+  const C = CFG.clock, pad = n => String(n).padStart(2, '0');
+  let h = now.getHours(), suffix = '';
+  if (C.hour12) { suffix = h < 12 ? 'AM' : 'PM'; h = h % 12 || 12; }
+  const txt = (C.hour12 ? String(h) : pad(h)) + ':' + pad(now.getMinutes()) + (C.seconds ? ':' + pad(now.getSeconds()) : '');
+  const colonOn = !C.blinkColon || now.getMilliseconds() < 500;
+  const seg = C.font === 'segment', F = CLOCK_FONTS[C.font] || CLOCK_FONTS.pixel, fh = seg ? 7 : F.h;
+  const on = [], off = [];
+  const put = (rows, x0, y0, list) => rows.forEach((row, y) => {
+    for (let i = 0; i < row.length; i++) if (row[i] === '#') list.push([x0 + i, y0 + y]);
+  });
+  let x = 0;
+  for (const ch of txt) {
+    if (ch === ':') { put(seg ? CLOCK_FONTS.pixel.g[':'] : F.g[':'], x, 0, colonOn ? on : off); x += 2; }
+    else if (seg) {
+      const lit = CLOCK_DIGITS[+ch];
+      for (const [s, cells] of Object.entries(CLOCK_SEGMENTS)) for (const [cx, cy] of cells) (lit.includes(s) ? on : off).push([x + cx, cy]);
+      x += 5;
+    } else { put(F.g[ch], x, 0, on); x += F.g[ch][0].length + 1; }
+  }
+  if (suffix) {
+    const S = CLOCK_FONTS.small;
+    x += 1;
+    for (const ch of suffix) { put(S.g[ch], x, fh - S.h, on); x += 4; }
+  }
+  return { on, off, w: x - 1, h: fh };
+}
+
+// anchor: { x, y, align: 'left' | 'center' | 'right', valign: 'top' | 'bottom', scale, box } in art pixels;
+// unit = screen pixels per art pixel (1 when drawing into the art-sized buffer)
+function drawClock(g, anchor, unit = 1) {
+  const C = CFG.clock;
+  if (!C.show || !anchor) return;
+  const now = new Date(), L = clockLayout(now);
+  const s = Math.max(1, Math.round(C.size * (anchor.scale || 1)));
+  const w = L.w * s, h = L.h * s;
+  let x = anchor.align === 'right' ? anchor.x - w : anchor.align === 'center' ? anchor.x - Math.round(w / 2) : anchor.x;
+  let y = anchor.valign === 'bottom' ? anchor.y - h : anchor.y;
+  if (C.drift && !anchor.box) {              // wander a pixel or two each minute so it can't burn into the screen
+    const m = now.getHours() * 60 + now.getMinutes();
+    x += Math.round(Math.sin(m * .7) * 2 * s); y += Math.round(Math.cos(m * .45) * 1.5 * s);
+  }
+  const rect = (px, py, rw, rh) => g.fillRect((x + px) * unit, (y + py) * unit, rw * unit, rh * unit);
+  if (anchor.box) {                          // a little bedside-clock case
+    const p = 2 * s;
+    g.fillStyle = C.colors.box; rect(-p, -p, w + p * 2, h + p * 2);
+    g.fillStyle = 'rgba(255,255,255,.1)'; rect(-p, -p, w + p * 2, 1);
+    g.fillStyle = 'rgba(0,0,0,.45)'; rect(-p, h + p - 1, w + p * 2, 1);
+  }
+  if (C.glow > 0) {
+    g.globalAlpha = .16 * C.glow; g.fillStyle = C.colors.glow;
+    for (const [px, py] of L.on) rect(px * s - s, py * s - s, s * 3, s * 3);
+  }
+  g.fillStyle = C.colors.text;
+  if (L.off.length) { g.globalAlpha = .1; for (const [px, py] of L.off) rect(px * s, py * s, s, s); }
+  g.globalAlpha = 1;
+  for (const [px, py] of L.on) rect(px * s, py * s, s, s);
+}
+
+// A fixed clock position: a corner or the middle of the top or bottom edge
+function clockCorner(pos, W, H, margin) {
+  const top = !pos.startsWith('bottom');
+  const align = pos.endsWith('left') ? 'left' : pos.endsWith('right') ? 'right' : 'center';
+  return { x: align === 'left' ? margin : align === 'right' ? W - margin : Math.round(W / 2),
+    y: top ? margin : H - margin, align, valign: top ? 'top' : 'bottom' };
+}
+// The scene's own spot when position is 'auto', otherwise the chosen corner
+function clockAnchor(auto, W, H, k) {
+  const pos = CFG.clock.position;
+  const a = pos === 'auto' ? auto : clockCorner(pos, W, H, Math.round(8 * k));
+  return { ...a, scale: k, box: pos === 'auto' && auto.box };
+}
+
+/* ------------------------------------------------------------------
+ * App: sizing, seed, resize, input
+ * ------------------------------------------------------------------ */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const buf = makeCanvas(1, 1), bctx = buf.getContext('2d');
+let seed = parseSeed(), scene = null, lastTick = 0;
+
+function parseSeed() {
+  if (Number.isFinite(CFG.display.seed)) return CFG.display.seed >>> 0;
+  const n = parseInt(location.hash.slice(1), 10);
+  return Number.isFinite(n) ? n >>> 0 : (Math.random() * 2 ** 32) >>> 0;
+}
+
+function setup() {
+  const dpr = window.devicePixelRatio || 1;
+  const cw = Math.max(1, Math.floor(innerWidth * dpr)), ch = Math.max(1, Math.floor(innerHeight * dpr));
+  canvas.width = cw; canvas.height = ch;
+  const px = Math.max(1, Math.round(Math.min(cw, ch) / CFG.display.targetRows));
+  const W = Math.ceil(cw / px), H = Math.ceil(ch / px);
+  buf.width = W; buf.height = H;
+  scene = generateScene(seed, W, H);
+  scene.px = px;
+  const now = performance.now();
+  scene.lastRoll.jelly = scene.lastRoll.turtle = lastTick = now;
+  history.replaceState(null, '', '#' + seed);
+  draw(now);
+}
+
+function tick(S, t) {
+  const dt = Math.min(200, t - lastTick); lastTick = t;
+  // fish swim across, now and then turning round; new ones replace those that leave
+  S.fish = S.fish.filter(f => {
+    f.x += f.vx * dt;
+    if (t > f.turnAt && f.x > 0 && f.x < S.W - f.sp.w * S.ps) { f.vx = -f.vx; f.right = !f.right; f.turnAt = t + 30000 + Math.random() * 60000; }
+    return f.x > -f.sp.w * S.ps - 4 && f.x < S.W + 4;
+  });
+  while (S.fish.length < S.soloTarget) spawnFish(S, t, false);
+
+  for (const v of S.vents) if (t - v.last > v.gap) { v.last = t; v.gap = CFG.bubbles.everySeconds * 1000 * (.5 + Math.random()); addBubble(S, v, t); }
+
+  S.jellies = S.jellies.filter(j => {
+    const p = ((t - j.born) / j.pulseMs) % 1;
+    j.y += (p < .25 ? -9 : 1.2) * S.k * dt / 1000;
+    j.x += j.vx * dt;
+    return j.y > -j.r * 4;
+  });
+  S.turtles = S.turtles.filter(tt => { tt.x += tt.vx * dt; return tt.x > -30 * S.ps && tt.x < S.W + 4; });
+
+  if (t - S.lastRoll.jelly > CFG.jellyfish.everySeconds * 1000) {
+    S.lastRoll.jelly = t;
+    if (Math.random() < CFG.jellyfish.chance && S.jellies.length < 3) spawnJelly(S, t);
+  }
+  if (t - S.lastRoll.turtle > CFG.turtle.everyMinutes * 60000) {
+    S.lastRoll.turtle = t;
+    if (Math.random() < CFG.turtle.chance && !S.turtles.length) spawnTurtle(S, t);
+  }
+}
+
+function draw(t) {
+  tick(scene, t);
+  render(bctx, scene, t);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(buf, 0, 0, scene.W * scene.px, scene.H * scene.px);
+}
+
+let lastDraw = -Infinity;
+function loop(t) {
+  requestAnimationFrame(loop);
+  if (FRAME_INTERVAL) {
+    if (t - lastDraw < FRAME_INTERVAL - 1.5) return;
+    lastDraw = Math.max(lastDraw + FRAME_INTERVAL, t - FRAME_INTERVAL);
+  }
+  draw(t);
+}
+
+function regenerate() { seed = (Math.random() * 2 ** 32) >>> 0; setup(); }
+
+let resizeTimer = 0;
+addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(setup, 100); });
+if (CFG.display.clickToRegenerate) canvas.addEventListener('click', regenerate);
+else canvas.style.cursor = 'default';
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase(), now = performance.now();
+  if (k === 'r' && CFG.display.clickToRegenerate) regenerate();
+  if (k === 'f') { scene.soloTarget++; spawnFish(scene, now, false); }
+  if (k === 's' && scene.schools.length < 4) addSchool(scene);
+  if (k === 'j') spawnJelly(scene, now);
+  // X = this scene's rare visitor (Shift+X = its variation, where it has one)
+  if (k === 'x') spawnTurtle(scene, now);
+  if (k === 'b') burst(scene, now);
+  if (!CFG.display.animate) draw(now);
+});
+
+setup();
+if (CFG.display.animate) requestAnimationFrame(loop);
+
+window.aquarium = { get scene() { return scene; }, draw, setup, regenerate, spawnJelly, spawnTurtle };
+</script>
+</body>
+</html>

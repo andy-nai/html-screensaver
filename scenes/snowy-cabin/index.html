@@ -1,0 +1,829 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Snowy Cabin</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #050a1e; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; image-rendering: pixelated; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<!-- optional user settings; the page falls back to the defaults below if it's missing -->
+<script>
+  document.write('<script src="config.js?v=' + Date.now() + '"><\/script>');
+</script>
+<script>
+'use strict';
+
+/* ------------------------------------------------------------------
+ * Config — defaults, overridden by config.js (window.CABIN_CONFIG)
+ * ------------------------------------------------------------------ */
+const DEFAULTS = {
+  display: { targetRows: 200, animate: true, frameRate: 24, seed: null, clickToRegenerate: true },
+  sky: { colors: { gradient: ['#050a1e', '#081028', '#0c1733', '#111f40', '#18294d', '#22355a', '#2e4366'] } },
+  moon: { chance: .75, colors: { surface: '#eef0f6', shade: '#c4cad8', glow: '#b8c8ec' } },
+  stars: { count: 130, colors: ['#4a5584', '#8a96c4', '#cdd6f2', '#ffffff'] },
+  aurora: { chance: .3, speed: 1, colors: ['#3cf0a0', '#28d8c0', '#7a6cff'] },
+  snowfall: { density: 1, gustMinutes: 5, lightest: .2, wind: .5, colors: { flakes: '#eef4ff' } },
+  mountains: { colors: { rock: '#2a3658', snow: '#a8b8d8', shade: '#6a7ca4' } },
+  trees: {
+    density: 1,
+    colors: {
+      far:  { needles: '#1a2846', snow: '#5a6c94' },
+      mid:  { needles: '#0f1c30', snow: '#8a9cc0' },
+      near: { needles: '#081220', snow: '#b4c4e0' },
+      trunk: '#2a1e1e',
+    },
+  },
+  ground: { colors: { snow: ['#3a4c74', '#4a5e88', '#5a709a', '#6c82ac', '#7e94bc'], sparkle: '#ffffff' } },
+  cabin: {
+    flicker: .25,
+    colors: {
+      logs: ['#5a3a28', '#4a3020'], gaps: '#24160f', door: '#3a2418',
+      roofSnow: '#dce6f6', roofShade: '#9aaccc', chimney: '#5a5660',
+      window: '#ffc566', windowGlow: '#ff9c40', lantern: '#ffd890',
+    },
+  },
+  smoke: { amount: 1, colors: { puff: '#8a96b4' } },
+  animals: {
+    everySeconds: 40, chance: .45, footprintMinutes: 3,
+    colors: {
+      deer: '#7a5638', deerLight: '#c8a880', antlers: '#d8c8a8',
+      fox: '#d0662a', foxLight: '#f4ece0', dark: '#1a1418', tracks: '#4a5c86',
+    },
+  },
+  santa: {
+    everyMinutes: 15, chance: .15,
+    colors: {
+      suit: '#d82828', trim: '#f4f4f4', face: '#f0c8a0', sack: '#8a5a30',
+      sleigh: '#b01c1c', gold: '#e8c040', reindeer: '#7a5236', antlers: '#c8b090', nose: '#ff3030',
+    },
+  },
+  clock: { show: true, hour12: false, seconds: false, position: 'auto', font: 'pixel', size: 1,
+    blinkColon: false, drift: true, glow: 0.7, colors: { text: '#eef4ff', glow: '#9ab8ff', box: '#161214' } },
+};
+
+function mergeConfig(base, over, path = '') {
+  const out = { ...base };
+  for (const k of Object.keys(over || {})) {
+    const b = base[k], o = over[k], p = path ? `${path}.${k}` : k;
+    if (o === undefined) continue;
+    if (!(k in base)) { console.warn(`config.js: unknown setting "${p}" ignored`); continue; }
+    const isGroup = v => v && typeof v === 'object' && !Array.isArray(v);
+    out[k] = isGroup(b) && isGroup(o) ? mergeConfig(b, o, p) : o;
+  }
+  return out;
+}
+const CFG = mergeConfig(DEFAULTS, window.CABIN_CONFIG);
+const FRAME_INTERVAL = CFG.display.frameRate > 0 ? 1000 / CFG.display.frameRate : 0;
+
+/* ------------------------------------------------------------------
+ * Helpers: RNG, colour, dithering, noise
+ * ------------------------------------------------------------------ */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function makeRng(seed) {
+  const r = mulberry32(seed >>> 0);
+  return {
+    next: r,
+    range: (a, b) => a + r() * (b - a),
+    int: (a, b) => Math.floor(a + r() * (b - a + 1)),
+    pick: arr => arr[Math.floor(r() * arr.length)],
+    chance: p => r() < p,
+  };
+}
+const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const css = c => `rgb(${c[0] | 0},${c[1] | 0},${c[2] | 0})`;
+const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + .5) / 16);
+const TAU = Math.PI * 2;
+
+function makeCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+
+// Dithered pick from a gradient through `stops` at fraction f, for pixel (x, y)
+function ditherAt(stops, f, x, y) {
+  const n = stops.length - 1;
+  if (!n) return stops[0];
+  const v = clamp(f, 0, 1) * n, i = Math.min(n - 1, Math.floor(v));
+  return v - i > BAYER[(y & 3) * 4 + (x & 3)] ? stops[i + 1] : stops[i];
+}
+function putPixel(d, W, x, y, c) {
+  const o = (y * W + x) * 4;
+  d[o] = c[0]; d[o + 1] = c[1]; d[o + 2] = c[2]; d[o + 3] = 255;
+}
+
+function makeNoise(rng) {
+  const v = Array.from({ length: 256 }, () => rng.next());
+  const at = x => {
+    const i = Math.floor(x), f = x - i, s = (1 - Math.cos(f * Math.PI)) / 2;
+    return v[i & 255] * (1 - s) + v[(i + 1) & 255] * s;
+  };
+  return (x, oct = 3) => {
+    let sum = 0, amp = 1, tot = 0;
+    for (let o = 0; o < oct; o++) { sum += at(x * 2 ** o + o * 37) * amp; tot += amp; amp /= 2; }
+    return sum / tot;
+  };
+}
+
+function glow(b, x, y, r, color, alpha) {
+  if (alpha <= .01 || r <= 0) return;
+  const g = b.createRadialGradient(x + .5, y + .5, 0, x + .5, y + .5, r);
+  g.addColorStop(0, color); g.addColorStop(1, 'rgba(0,0,0,0)');
+  b.globalAlpha = alpha; b.fillStyle = g;
+  b.fillRect(x - r, y - r, r * 2 + 1, r * 2 + 1);
+  b.globalAlpha = 1;
+}
+
+/* ------------------------------------------------------------------
+ * Scene generation
+ * ------------------------------------------------------------------ */
+// A snow-laden pine standing on (x, groundY)
+function drawPine(g, rng, x, groundY, h, col, trunkCol) {
+  const trunkH = Math.max(1, Math.round(h * .1)), crownH = h - trunkH;
+  const tiers = Math.max(2, Math.round(h / 8)), tierH = crownH / tiers;
+  const maxHalf = Math.max(1, h * .21), tw = h > 40 ? 2 : 1;
+  g.fillStyle = trunkCol; g.fillRect(x - (tw >> 1), groundY - trunkH, tw, trunkH + 1);
+  const top = groundY - trunkH - crownH;
+  for (let r = 0; r < crownH; r++) {
+    const tier = Math.min(tiers - 1, Math.floor(r / tierH)), within = (r - tier * tierH) / tierH;
+    const tierHalf = maxHalf * (.3 + .7 * (tier + 1) / tiers);
+    const half = Math.round(tier === 0 ? tierHalf * within : tierHalf * (.45 + .55 * within));
+    const y = top + r;
+    g.fillStyle = col.needles; g.fillRect(x - half, y, half * 2 + 1, 1);
+    // snow on top of each tier and along the lit (left) side
+    g.fillStyle = col.snow;
+    if (within < 1.2 / tierH && r > 0) g.fillRect(x - half, y, half * 2 + 1, 1);
+    else if (within < .55) g.fillRect(x - half, y, Math.max(1, Math.round(half * rng.range(.3, .8))), 1);
+    if (r === 0) g.fillRect(x, y, 1, 1);
+  }
+}
+
+function generateScene(seed, W, H) {
+  const rng = makeRng(seed), noise = makeNoise(rng);
+  const k = H / 200, ps = Math.max(1, Math.round(k));
+  const S = { seed, W, H, k, ps, smoke: [], animals: [], tracks: [], lastRoll: 0, lastSmoke: 0,
+    santa: null, sparkle: [], lastSantaRoll: 0 };
+  const hz = Math.round(H * .56);
+  S.hz = hz;
+
+  // sky
+  const sky = makeCanvas(W, H), sx = sky.getContext('2d'), si = sx.createImageData(W, H);
+  const skyStops = CFG.sky.colors.gradient.map(hexRgb);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) putPixel(si.data, W, x, y, ditherAt(skyStops, y / hz, x, y));
+  sx.putImageData(si, 0, 0);
+  S.sky = sky;
+
+  S.stars = Array.from({ length: Math.round(CFG.stars.count * W / 356) }, () => ({
+    x: rng.int(0, W - 1), y: Math.floor(hz * rng.next() ** 1.3 * .9), c: rng.int(0, CFG.stars.colors.length - 1),
+    sp: rng.range(.0006, .002), ph: rng.range(0, TAU),
+  }));
+  S.moon = rng.chance(CFG.moon.chance) ? {
+    x: Math.round(W * rng.range(.12, .88)), y: Math.round(hz * rng.range(.15, .4)), r: Math.max(3, Math.round(7 * k)),
+    craters: Array.from({ length: 4 }, () => [rng.range(-.5, .5), rng.range(-.5, .5)]),
+  } : null;
+  S.aurora = rng.chance(CFG.aurora.chance);
+  S.auroraPh = rng.range(0, 1000);
+
+  // land: mountains, far forest, clearing with the cabin, near snow
+  const land = makeCanvas(W, H), g = land.getContext('2d');
+  const MC = CFG.mountains.colors;
+  const mBase = Math.round(H * .6), peak = x => (1 - Math.abs(2 * noise(x * .006 + 11, 2) - 1)) ** 1.6;
+  const ridge = x => Math.round(mBase - H * (.08 + .22 * peak(x)) - noise(x * .06 + 5, 2) * 5 * k);
+  const smoothRidge = x => H * (.08 + .22 * peak(x));
+  for (let x = 0; x < W; x++) {
+    const top = ridge(x);
+    // light comes from the left: slopes facing right are in shade
+    const slope = smoothRidge(x + 4 * k) - smoothRidge(x - 4 * k);
+    const snowDepth = (mBase - top) * (.35 + .25 * noise(x * .05 + 3, 2));
+    for (let y = top; y < mBase; y++) {
+      const isSnow = y - top < snowDepth + (BAYER[(y & 3) * 4 + (x & 3)] - .5) * 4 * k;
+      const shade = slope < -.3 * k;
+      g.fillStyle = isSnow ? (shade ? MC.shade : MC.snow) : MC.rock;
+      g.fillRect(x, y, 1, 1);
+    }
+  }
+
+  const snowStops = CFG.ground.colors.snow.map(hexRgb);
+  // a band of snowy ground following `contour`, shaded with stops[from..to]
+  const groundLayer = (contour, from, to) => {
+    const c = makeCanvas(W, H), cx = c.getContext('2d'), img = cx.createImageData(W, H);
+    const stops = snowStops.slice(from, to + 1);
+    for (let x = 0; x < W; x++) {
+      const top = contour(x);
+      for (let y = Math.max(0, top); y < H; y++) putPixel(img.data, W, x, y, ditherAt(stops, (y - top) / (H - top) * 1.6, x, y));
+    }
+    cx.putImageData(img, 0, 0);
+    return c;
+  };
+
+  const TC = CFG.trees.colors, dens = CFG.trees.density;
+  // far forest: a dense line of small trees
+  const farY = x => Math.round(H * .6 + (noise(x * .01 + 20) - .5) * 6 * k);
+  g.drawImage(groundLayer(farY, 0, 2), 0, 0);
+  for (let x = -4; x < W + 4; x += Math.max(2, Math.round(rng.range(3, 6) * k / dens))) {
+    drawPine(g, rng, x, farY(x) + 1, Math.round(rng.range(9, 18) * k), TC.far, TC.trunk);
+  }
+
+  // clearing with the cabin
+  const cabW = Math.round(46 * k), cabX = Math.round(W * rng.range(.3, .65));
+  const midBase = Math.round(H * .7);
+  const flat = x => clamp(1 - (Math.abs(x - (cabX + cabW / 2)) - cabW * .7) / (30 * k), 0, 1);
+  const midY = x => Math.round(midBase + (noise(x * .012 + 40) - .5) * 10 * k * (1 - flat(x)));
+  // mid trees behind the cabin, keeping clear of it
+  const midTrees = [];
+  for (let x = -6; x < W + 6; x += Math.max(4, Math.round(rng.range(8, 20) * k / dens))) {
+    if (x > cabX - 14 * k && x < cabX + cabW + 14 * k) continue;
+    midTrees.push([x + rng.int(-2, 2), Math.round(rng.range(22, 38) * k)]);
+  }
+  for (const [x, h] of midTrees) drawPine(g, rng, x, midY(x) - Math.round(3 * k), h, TC.mid, TC.trunk);
+  g.drawImage(groundLayer(midY, 1, 3), 0, 0);
+
+  S.cabin = drawCabin(g, rng, cabX, midY(cabX + cabW / 2), cabW, k);
+
+  // near snow, with sparkles and a few snow-covered shrubs
+  const nearY = x => Math.round(H * .8 + (noise(x * .008 + 70) - .5) * 14 * k);
+  S.nearY = nearY;
+  const near = groundLayer(x => Math.min(nearY(x), H - 1), 2, 4);
+  g.drawImage(near, 0, 0);
+  for (let i = rng.int(2, 5); i > 0; i--) {
+    const x = rng.int(0, W), w = Math.round(rng.range(6, 14) * k), y = nearY(x);
+    for (let r = 0; r < w / 2.5; r++) {
+      const half = Math.round(Math.sqrt(1 - (r / (w / 2.5)) ** 2) * w / 2);
+      g.fillStyle = r === 0 ? '#2a3a5e' : r < 2 ? CFG.ground.colors.snow[4] : CFG.ground.colors.snow[3];
+      g.fillRect(x - half, y - r, half * 2 + 1, 1);
+    }
+  }
+  S.land = land;
+  S.sparkles = Array.from({ length: Math.round(W / 4) }, () => {
+    const x = rng.int(0, W - 1);
+    return { x, y: rng.int(nearY(x) + 2, H - 1), sp: rng.range(.0005, .0015), ph: rng.range(0, TAU) };
+  });
+
+  // near trees framing the edges, drawn in front of everything that moves
+  const front = makeCanvas(W, H), f = front.getContext('2d');
+  for (const side of [0, 1]) {
+    for (let i = rng.int(1, 2); i > 0; i--) {
+      const x = side ? W - rng.int(-6, Math.round(W * .1)) : rng.int(-6, Math.round(W * .1));
+      drawPine(f, rng, x, H - rng.int(0, Math.round(10 * k)), Math.round(H * rng.range(.4, .62)), TC.near, TC.trunk);
+    }
+  }
+  S.front = front;
+  S.animalY = [Math.round(H * .82), Math.round(H * .92)];
+
+  // snowflakes: positions are a function of time, so they need no state
+  S.flakes = Array.from({ length: Math.round(W * H / 55 * CFG.snowfall.density) }, () => {
+    const depth = rng.next() < .5 ? 0 : rng.next() < .65 ? 1 : 2;
+    return { x0: rng.range(0, W), y0: rng.range(0, H), depth, rank: rng.next(),
+      v: [5, 9, 15][depth] * k * rng.range(.8, 1.2), sway: rng.range(.5, 2.5) * k, ph: rng.range(0, TAU), sp: rng.range(.0004, .001) };
+  });
+  S.gustPh = rng.range(0, TAU);
+  // clock in the top corner away from the moon, frosty white
+  const cm = Math.round(8 * k), moonRight = S.moon && S.moon.x > W / 2;
+  S.clock = clockAnchor({ x: moonRight ? cm : W - cm, y: cm, align: moonRight ? 'left' : 'right', valign: 'top' }, W, H, k);
+  return S;
+}
+
+// Log cabin with a snowy gable roof, centred in [x, x + w], standing on groundY
+function drawCabin(g, rng, x, groundY, w, k) {
+  const CC = CFG.cabin.colors, cx = x + Math.round(w / 2);
+  const wallH = Math.round(17 * k), wallTop = groundY - wallH;
+  const logH = Math.max(2, Math.round(3 * k));
+  const logRow = y => (Math.floor((groundY - y) / logH) % 2);
+  // walls with log ends sticking out at the corners
+  for (let y = wallTop; y <= groundY; y++) {
+    const gap = (groundY - y) % logH === logH - 1;
+    g.fillStyle = gap ? CC.gaps : CC.logs[logRow(y)];
+    g.fillRect(x, y, w, 1);
+    if (!gap) { g.fillStyle = CC.logs[0]; g.fillRect(x - 1, y, 1, 1); g.fillRect(x + w, y, 1, 1); }
+  }
+  // roof: a big snow triangle with the log gable inset into it
+  const over = Math.round(4 * k), gh = Math.round(w * .42), th = Math.max(2, Math.round(3 * k));
+  for (let r = 0; r <= gh + th; r++) {
+    const half = Math.round((w / 2 + over) * r / (gh + th));
+    g.fillStyle = CC.roofSnow; g.fillRect(cx - half, wallTop - gh - th + r, half * 2 + 1, 1);
+  }
+  for (let r = 0; r <= gh; r++) {
+    const y = wallTop - gh + r, half = Math.round((w / 2 - 1) * r / gh);
+    const gap = (groundY - y) % logH === logH - 1;
+    g.fillStyle = gap ? CC.gaps : CC.logs[logRow(y)];
+    g.fillRect(cx - half, y, half * 2 + 1, 1);
+    g.fillStyle = CC.roofShade;                          // shadow under the eaves
+    g.fillRect(cx - half - 1, y, 1, 1); g.fillRect(cx + half + 1, y, 1, 1);
+  }
+  // icicles
+  g.fillStyle = '#c8daf4';
+  for (let i = x - over; i < x + w + over; i += rng.int(2, 4)) if (rng.chance(.5)) g.fillRect(i, wallTop + 1, 1, rng.int(1, Math.max(1, Math.round(3 * k))));
+  // chimney on the right slope
+  const chX = cx + Math.round(w * .22), chW = Math.max(3, Math.round(5 * k));
+  const roofAt = xx => wallTop - gh - th + Math.round(Math.abs(xx - cx) / (w / 2 + over) * (gh + th));
+  const chTop = roofAt(chX) - Math.round(9 * k);
+  g.fillStyle = CFG.cabin.colors.chimney; g.fillRect(chX, chTop, chW, roofAt(chX + chW) - chTop + 2);
+  g.fillStyle = 'rgba(0,0,0,.25)'; g.fillRect(chX + chW - 1, chTop, 1, roofAt(chX + chW) - chTop + 2);
+  g.fillStyle = CC.roofSnow; g.fillRect(chX - 1, chTop - 1, chW + 2, Math.max(1, Math.round(k)));
+  // door
+  const dW = Math.round(8 * k), dH = Math.round(12 * k), dX = cx - (dW >> 1);
+  g.fillStyle = CC.door; g.fillRect(dX, groundY - dH, dW, dH + 1);
+  g.fillStyle = CC.gaps; g.fillRect(dX - 1, groundY - dH - 1, dW + 2, 1);
+  g.fillStyle = '#c8a050'; g.fillRect(dX + dW - 2, groundY - Math.round(dH / 2), 1, 1);
+  // windows (lit at draw time) and a lantern by the door
+  const wW = Math.round(8 * k), wH = Math.round(6 * k), wY = wallTop + Math.round(4 * k);
+  const windows = [cx - Math.round(w * .3) - (wW >> 1), cx + Math.round(w * .3) - (wW >> 1)].map(wx => ({ x: wx, y: wY, w: wW, h: wH }));
+  windows.push({ x: cx - Math.round(2 * k), y: wallTop - Math.round(gh * .5), w: Math.max(2, Math.round(4 * k)), h: Math.max(2, Math.round(3 * k)), dim: true });
+  for (const wd of windows) { g.fillStyle = CC.gaps; g.fillRect(wd.x - 1, wd.y - 1, wd.w + 2, wd.h + 2); }
+  // woodpile against the left wall
+  const wpX = x - Math.round(12 * k), wpW = Math.round(10 * k), lr = Math.max(2, Math.round(2 * k));
+  for (let row = 0; row < 3; row++) for (let i = 0; i < Math.floor(wpW / lr) - row; i++) {
+    const lx = wpX + i * lr + row * (lr >> 1), ly = groundY - (row + 1) * lr;
+    g.fillStyle = '#8a6040'; g.fillRect(lx, ly, lr, lr);
+    g.fillStyle = '#5a3a24'; g.fillRect(lx + (lr >> 1), ly + (lr >> 1), 1, 1);
+  }
+  g.fillStyle = CC.roofSnow; g.fillRect(wpX + lr, groundY - 3 * lr - 1, wpW - lr * 2, 1);
+  return { x, w, cx, groundY, windows, chimney: { x: chX + (chW >> 1), y: chTop - 1 },
+    lantern: { x: dX + dW + Math.round(2 * k), y: groundY - Math.round(9 * k) }, ph: rng.range(0, 100) };
+}
+
+/* ------------------------------------------------------------------
+ * Visitors: deer and foxes, drawn from little pixel maps
+ * ------------------------------------------------------------------ */
+const DEER = {
+  body: [
+    '........a.a.',
+    '........aa..',
+    '........hhh.',
+    '........hhhD',
+    '........hh..',
+    'wbbbbbbbbb..',
+    '.bbbbbbbbb..',
+    '.bbLLLLLbb..',
+  ],
+  legs: [['.b.b...b.b..', '.b.b...b.b..', '.D.D...D.D..'], ['..b.b.b..b..', '..b.b.b..b..', '..D.D.D..D..']],
+  speed: 5, stepMs: 260, pause: true,
+};
+const FOX = {
+  body: [
+    '...........o.o',
+    '..........ooo.',
+    '..........oooD',
+    'tt.ooooooooo..',
+    'ttoooooooooo..',
+    'Wt.LLLLLLL....',
+  ],
+  legs: [['...K.K...K.K..'], ['....K.K.K.K...']],
+  speed: 9, stepMs: 170, pause: false,
+};
+
+/* ------------------------------------------------------------------
+ * A very rare visitor: Santa's sleigh and three reindeer crossing the sky
+ * ------------------------------------------------------------------ */
+const SLEIGH = [
+  '......rr........',
+  '.....rrrW.......',
+  '..SS..ff........',
+  '.SSSS.WWr.......',
+  '.SSSSrrrr.......',
+  'kkkkkkkkkkkkk...',
+  '.kkkkkkkkkkkk.g.',
+  '..kkkkkkkkkkk.g.',
+  '...gggggggggggg.',
+];
+const REINDEER = {
+  body: [
+    '.......a.a',
+    '........a.',
+    '.......hhh',
+    '.......hhN',
+    'bbbbbbbbh.',
+    '.bbbbbbb..',
+  ],
+  legs: [['.l....l...', 'l......l..'], ['..l..l....', '..l..l....']],
+};
+
+// Two gallop frames of the whole team facing right, plus where the lead reindeer's nose is
+function makeSantaSprites() {
+  const SC = CFG.santa.colors, w = 16 + 3 * 13 + 1, h = 12;
+  const pal = { r: SC.suit, W: SC.trim, f: SC.face, S: SC.sack, k: SC.sleigh, g: SC.gold,
+    a: SC.antlers, h: SC.reindeer, b: SC.reindeer, N: '#1a1010', l: mixRgb(SC.reindeer, .7) };
+  const put = (g, rows, x0, y0) => rows.forEach((row, y) => { for (let x = 0; x < row.length; x++) {
+    const p = pal[row[x]]; if (p) { g.fillStyle = p; g.fillRect(x0 + x, y0 + y, 1, 1); } } });
+  let nose = null;
+  const frames = [0, 1].map(frame => {
+    const c = makeCanvas(w, h), g = c.getContext('2d');
+    put(g, SLEIGH, 0, 2);
+    // reins from the sleigh to the lead reindeer
+    g.fillStyle = '#4a3020'; g.fillRect(13, 7, w - 13 - 6, 1);
+    for (let i = 0; i < 3; i++) {
+      const bob = (i + frame) % 2, x = 17 + i * 13, y = 1 + bob;
+      put(g, [...REINDEER.body, ...REINDEER.legs[(i + frame) % 2]], x, y);
+      if (i === 2) nose = { x: x + 9, y: y + 3 };
+    }
+    return c;
+  });
+  return { w, h, frames, flippedFrames: frames.map(f => {
+    const c = makeCanvas(w, h), g = c.getContext('2d'); g.translate(w, 0); g.scale(-1, 1); g.drawImage(f, 0, 0); return c;
+  }), nose };
+}
+function mixRgb(hex, f) { const c = hexRgb(hex); return css(c.map(v => v * f)); }
+
+function spawnSanta(S, t) {
+  if (S.santa) return;
+  S.santaSprites = S.santaSprites || makeSantaSprites();
+  const right = Math.random() < .5, sw = S.santaSprites.w * S.ps;
+  // fly across the moon when there is one
+  const y = S.moon ? S.moon.y - 6 * S.ps : S.hz * (.15 + Math.random() * .2);
+  S.santa = { right, x0: right ? -sw - 4 : S.W + 4, y, t0: t, vx: (right ? 1 : -1) * 24 * S.k / 1000, sw };
+}
+
+function drawSanta(b, S, t) {
+  const s = S.santa, sp = S.santaSprites, ps = S.ps;
+  const x = s.x0 + s.vx * (t - s.t0);
+  if (x < -s.sw - 40 * S.k || x > S.W + 40 * S.k) { S.santa = null; return; }
+  const y = Math.round(s.y + Math.sin(t * .0012) * 2 * S.k);
+  const frame = Math.floor(t / 220) % 2;
+  // a trail of sparkles behind the sleigh
+  const tailX = s.right ? x : x + s.sw;
+  if (Math.random() < .8) S.sparkle.push({ x: tailX, y: y + 8 * ps + (Math.random() - .5) * 4 * ps, t });
+  S.sparkle = S.sparkle.filter(p => t - p.t < 1600);
+  for (const p of S.sparkle) {
+    const age = (t - p.t) / 1600;
+    b.globalAlpha = 1 - age; b.fillStyle = Math.random() < .5 ? CFG.santa.colors.gold : '#ffffff';
+    b.fillRect(Math.round(p.x), Math.round(p.y + age * 6 * S.k), ps, ps);
+  }
+  b.globalAlpha = 1;
+  b.drawImage((s.right ? sp.frames : sp.flippedFrames)[frame], Math.round(x), y, sp.w * ps, sp.h * ps);
+  // Rudolph's nose, blinking
+  const nx = s.right ? sp.nose.x : sp.w - 1 - sp.nose.x;
+  // (sp.nose is from frame 1, where the lead reindeer is a pixel lower)
+  const nX = Math.round(x) + nx * ps, nY = y + (sp.nose.y - (frame === 0 ? 1 : 0)) * ps;
+  const on = .6 + .4 * Math.sin(t * .008);
+  b.fillStyle = CFG.santa.colors.nose; b.fillRect(nX, nY, ps, ps);
+  glow(b, nX, nY, 4 * S.k, CFG.santa.colors.nose, .6 * on);
+}
+
+function spawnAnimal(S, t, kind) {
+  kind = kind || (Math.random() < .5 ? 'deer' : 'fox');
+  const right = Math.random() < .5, def = kind === 'deer' ? DEER : FOX;
+  const w = def.body[0].length * S.ps;
+  const [y0, y1] = S.animalY;
+  S.animals.push({ kind, def, right, w, x: right ? -w - 2 : S.W + 2, y: Math.round(y0 + Math.random() * (y1 - y0)),
+    v: def.speed * S.k * (.85 + Math.random() * .3), state: 'walk', until: 0, lastStep: 0, dist: 0 });
+}
+
+function drawAnimal(b, S, a, t) {
+  const AC = CFG.animals.colors, ps = S.ps;
+  const pal = a.kind === 'deer'
+    ? { a: AC.antlers, h: AC.deer, b: AC.deer, w: AC.deerLight, L: AC.deerLight, D: AC.dark }
+    : { o: AC.fox, t: AC.fox, W: AC.foxLight, L: AC.foxLight, D: AC.dark, K: AC.dark };
+  const walking = a.state === 'walk';
+  const frame = walking ? Math.floor(t / a.def.stepMs) % 2 : 0;
+  const rows = [...a.def.body, ...a.def.legs[frame]];
+  const top = a.y - rows.length * ps + 1, x0 = Math.round(a.x);
+  rows.forEach((row, ry) => {
+    for (let rx = 0; rx < row.length; rx++) {
+      const ch = row[rx];
+      if (ch === '.' || !pal[ch]) continue;
+      const px = a.right ? rx : row.length - 1 - rx;
+      b.fillStyle = pal[ch]; b.fillRect(x0 + px * ps, top + ry * ps, ps, ps);
+    }
+  });
+}
+
+/* ------------------------------------------------------------------
+ * Drawing
+ * ------------------------------------------------------------------ */
+function render(b, S, t) {
+  const { W, H, k } = S;
+  b.drawImage(S.sky, 0, 0);
+
+  const SC = CFG.stars.colors;
+  for (const s of S.stars) {
+    b.globalAlpha = .6 + .4 * Math.sin(t * s.sp + s.ph);
+    b.fillStyle = SC[s.c]; b.fillRect(s.x, s.y, 1, 1);
+  }
+  b.globalAlpha = 1;
+
+  if (S.aurora) drawAurora(b, S, t);
+
+  if (S.moon) {
+    const m = S.moon, MC = CFG.moon.colors;
+    glow(b, m.x, m.y, m.r * 5, MC.glow, .22);
+    for (let dy = -m.r; dy <= m.r; dy++) {
+      const hw = Math.round(Math.sqrt(m.r * m.r - dy * dy));
+      b.fillStyle = MC.surface; b.fillRect(m.x - hw, m.y + dy, hw * 2 + 1, 1);
+    }
+    b.fillStyle = MC.shade;
+    for (const [cx, cy] of m.craters) b.fillRect(Math.round(m.x + cx * m.r), Math.round(m.y + cy * m.r), Math.max(1, Math.round(m.r / 4)), Math.max(1, Math.round(m.r / 4)));
+  }
+
+  if (S.santa || S.sparkle.length) {
+    if (S.santa) drawSanta(b, S, t);
+    else { S.sparkle = S.sparkle.filter(p => t - p.t < 1600); }
+  }
+
+  b.drawImage(S.land, 0, 0);
+
+  // firelight in the windows, spilling onto the snow
+  const C = S.cabin, CC = CFG.cabin.colors, fl = CFG.cabin.flicker;
+  const flick = 1 - fl * (.5 + .25 * Math.sin(t * .0071 + C.ph) + .15 * Math.sin(t * .0193) + .1 * Math.sin(t * .041 + 2));
+  for (const wd of C.windows) {
+    const a = wd.dim ? .6 * flick : flick;
+    b.fillStyle = CC.windowGlow; b.fillRect(wd.x, wd.y, wd.w, wd.h);
+    b.globalAlpha = a; b.fillStyle = CC.window; b.fillRect(wd.x, wd.y, wd.w, wd.h); b.globalAlpha = 1;
+    if (!wd.dim) {
+      b.fillStyle = CC.gaps;
+      b.fillRect(wd.x + (wd.w >> 1), wd.y, 1, wd.h); b.fillRect(wd.x, wd.y + (wd.h >> 1), wd.w, 1);
+      // light on the snow below
+      for (let r = 0; r < 10 * k; r++) {
+        const y = C.groundY + 1 + r, spread = Math.round(r * .8);
+        b.globalAlpha = .22 * flick * (1 - r / (10 * k));
+        b.fillStyle = CC.windowGlow; b.fillRect(wd.x - spread, y, wd.w + spread * 2, 1);
+      }
+      b.globalAlpha = 1;
+    }
+    glow(b, wd.x + wd.w / 2, wd.y + wd.h / 2, wd.w * 1.4, CC.windowGlow, .25 * a);
+  }
+  glow(b, C.lantern.x, C.lantern.y, 6 * k, CC.lantern, .5 * flick);
+  b.fillStyle = CC.lantern; b.fillRect(C.lantern.x, C.lantern.y, Math.max(1, Math.round(k)), Math.max(2, Math.round(2 * k)));
+
+  // chimney smoke
+  const puff = CFG.smoke.colors.puff, life = 9000;
+  S.smoke = S.smoke.filter(p => t - p.born < life);
+  for (const p of S.smoke) {
+    const age = (t - p.born) / life;
+    const x = Math.round(p.x + p.drift * age * 30 * k + Math.sin(age * 6 + p.ph) * 2 * k);
+    const y = Math.round(p.y - age * 40 * k);
+    const r = Math.round((1 + age * 3.5) * k);
+    b.globalAlpha = .4 * (1 - age) * Math.min(1, age * 8); b.fillStyle = puff;
+    for (let dy = -r; dy <= r; dy++) { const hw = Math.round(Math.sqrt(r * r - dy * dy)); b.fillRect(x - hw, y + dy, hw * 2 + 1, 1); }
+  }
+  b.globalAlpha = 1;
+
+  // sparkles on the near snow
+  b.fillStyle = CFG.ground.colors.sparkle;
+  for (const s of S.sparkles) if (Math.sin(t * s.sp + s.ph) > .985) b.fillRect(s.x, s.y, 1, 1);
+
+  // tracks, then visitors
+  const tl = CFG.animals.footprintMinutes * 60000;
+  S.tracks = S.tracks.filter(p => t - p.t < tl);
+  b.fillStyle = CFG.animals.colors.tracks;
+  for (const p of S.tracks) { b.globalAlpha = .8 * (1 - (t - p.t) / tl); b.fillRect(p.x, p.y, S.ps, 1); }
+  b.globalAlpha = 1;
+  for (const a of S.animals) drawAnimal(b, S, a, t);
+
+  b.drawImage(S.front, 0, 0);
+
+  drawClock(b, S.clock);              // behind the falling snow
+
+  // falling snow, heavier and lighter in slow waves
+  const SF = CFG.snowfall;
+  const gust = SF.lightest + (1 - SF.lightest) * (.5 + .5 * Math.sin(TAU * t / (Math.max(.1, SF.gustMinutes) * 60000) + S.gustPh));
+  b.fillStyle = SF.colors.flakes;
+  const alphas = [.35, .65, .95];
+  for (const f of S.flakes) {
+    if (f.rank > gust) continue;
+    const secs = t / 1000;
+    const y = ((f.y0 + f.v * secs) % (H + 4) + H + 4) % (H + 4) - 2;
+    const x = ((f.x0 + SF.wind * f.v * secs * .7 + Math.sin(t * f.sp + f.ph) * f.sway) % W + W) % W;
+    b.globalAlpha = alphas[f.depth];
+    const sz = f.depth === 2 ? Math.max(2, Math.round(1.5 * k)) : Math.max(1, Math.round(k * .8));
+    b.fillRect(Math.round(x), Math.round(y), sz, sz);
+  }
+  b.globalAlpha = 1;
+}
+
+function drawAurora(b, S, t) {
+  const { W, hz } = S, A = CFG.aurora, tt = t * A.speed + S.auroraPh * 1000;
+  const n = makeNoiseCache(S);
+  for (let x = 0; x < W; x++) {
+    const base = hz * (.32 + .18 * n(x * .006 + tt * .00002));
+    const height = hz * (.12 + .25 * n(x * .018 - tt * .00004 + 30));
+    const inten = n(x * .011 + tt * .00006 + 70) ** 2.2;
+    if (inten < .05) continue;
+    const col = A.colors[Math.floor(n(x * .004 + 90) * A.colors.length * .999)];
+    b.fillStyle = col;
+    b.globalAlpha = .7 * inten; b.fillRect(x, Math.round(base), 1, 2);
+    b.globalAlpha = .38 * inten; b.fillRect(x, Math.round(base - height * .5), 1, Math.round(height * .5));
+    b.globalAlpha = .16 * inten; b.fillRect(x, Math.round(base - height), 1, Math.round(height * .5));
+  }
+  b.globalAlpha = 1;
+}
+function makeNoiseCache(S) { return S.auroraNoise || (S.auroraNoise = makeNoise(makeRng(S.seed ^ 0xA5A5))); }
+
+/* ------------------------------------------------------------------
+ * Clock (settings in config.js under `clock`)
+ * ------------------------------------------------------------------ */
+const CLOCK_FONTS = {
+  pixel: { h: 7, g: {
+    '0': [' ### ', '#   #', '#  ##', '# # #', '##  #', '#   #', ' ### '],
+    '1': ['  #  ', ' ##  ', '  #  ', '  #  ', '  #  ', '  #  ', ' ### '],
+    '2': [' ### ', '#   #', '    #', '   # ', '  #  ', ' #   ', '#####'],
+    '3': ['#####', '   # ', '  #  ', '   # ', '    #', '#   #', ' ### '],
+    '4': ['   # ', '  ## ', ' # # ', '#  # ', '#####', '   # ', '   # '],
+    '5': ['#####', '#    ', '#### ', '    #', '    #', '#   #', ' ### '],
+    '6': ['  ## ', ' #   ', '#    ', '#### ', '#   #', '#   #', ' ### '],
+    '7': ['#####', '    #', '   # ', '  #  ', ' #   ', ' #   ', ' #   '],
+    '8': [' ### ', '#   #', '#   #', ' ### ', '#   #', '#   #', ' ### '],
+    '9': [' ### ', '#   #', '#   #', ' ####', '    #', '   # ', ' ##  '],
+    ':': [' ', ' ', '#', ' ', '#', ' ', ' '],
+  } },
+  small: { h: 5, g: {
+    '0': ['###', '# #', '# #', '# #', '###'], '1': [' # ', '## ', ' # ', ' # ', '###'],
+    '2': ['###', '  #', '###', '#  ', '###'], '3': ['###', '  #', '###', '  #', '###'],
+    '4': ['# #', '# #', '###', '  #', '  #'], '5': ['###', '#  ', '###', '  #', '###'],
+    '6': ['###', '#  ', '###', '# #', '###'], '7': ['###', '  #', '  #', '  #', '  #'],
+    '8': ['###', '# #', '###', '# #', '###'], '9': ['###', '# #', '###', '  #', '###'],
+    ':': [' ', '#', ' ', '#', ' '],
+    'A': ['###', '# #', '###', '# #', '# #'], 'P': ['###', '# #', '###', '#  ', '#  '], 'M': ['# #', '###', '###', '# #', '# #'],
+  } },
+};
+// LED digits: which segments each digit lights, and the cells of each segment in a 4×7 box
+const CLOCK_DIGITS = ['abcdef', 'bc', 'abged', 'abgcd', 'fgbc', 'afgcd', 'afgedc', 'abc', 'abcdefg', 'abcdfg'];
+const CLOCK_SEGMENTS = { a: [[1, 0], [2, 0]], b: [[3, 1], [3, 2]], c: [[3, 4], [3, 5]], d: [[1, 6], [2, 6]],
+  e: [[0, 4], [0, 5]], f: [[0, 1], [0, 2]], g: [[1, 3], [2, 3]] };
+
+// The current time as lists of lit (and, for LED digits, unlit) cells in font pixels
+function clockLayout(now) {
+  const C = CFG.clock, pad = n => String(n).padStart(2, '0');
+  let h = now.getHours(), suffix = '';
+  if (C.hour12) { suffix = h < 12 ? 'AM' : 'PM'; h = h % 12 || 12; }
+  const txt = (C.hour12 ? String(h) : pad(h)) + ':' + pad(now.getMinutes()) + (C.seconds ? ':' + pad(now.getSeconds()) : '');
+  const colonOn = !C.blinkColon || now.getMilliseconds() < 500;
+  const seg = C.font === 'segment', F = CLOCK_FONTS[C.font] || CLOCK_FONTS.pixel, fh = seg ? 7 : F.h;
+  const on = [], off = [];
+  const put = (rows, x0, y0, list) => rows.forEach((row, y) => {
+    for (let i = 0; i < row.length; i++) if (row[i] === '#') list.push([x0 + i, y0 + y]);
+  });
+  let x = 0;
+  for (const ch of txt) {
+    if (ch === ':') { put(seg ? CLOCK_FONTS.pixel.g[':'] : F.g[':'], x, 0, colonOn ? on : off); x += 2; }
+    else if (seg) {
+      const lit = CLOCK_DIGITS[+ch];
+      for (const [s, cells] of Object.entries(CLOCK_SEGMENTS)) for (const [cx, cy] of cells) (lit.includes(s) ? on : off).push([x + cx, cy]);
+      x += 5;
+    } else { put(F.g[ch], x, 0, on); x += F.g[ch][0].length + 1; }
+  }
+  if (suffix) {
+    const S = CLOCK_FONTS.small;
+    x += 1;
+    for (const ch of suffix) { put(S.g[ch], x, fh - S.h, on); x += 4; }
+  }
+  return { on, off, w: x - 1, h: fh };
+}
+
+// anchor: { x, y, align: 'left' | 'center' | 'right', valign: 'top' | 'bottom', scale, box } in art pixels;
+// unit = screen pixels per art pixel (1 when drawing into the art-sized buffer)
+function drawClock(g, anchor, unit = 1) {
+  const C = CFG.clock;
+  if (!C.show || !anchor) return;
+  const now = new Date(), L = clockLayout(now);
+  const s = Math.max(1, Math.round(C.size * (anchor.scale || 1)));
+  const w = L.w * s, h = L.h * s;
+  let x = anchor.align === 'right' ? anchor.x - w : anchor.align === 'center' ? anchor.x - Math.round(w / 2) : anchor.x;
+  let y = anchor.valign === 'bottom' ? anchor.y - h : anchor.y;
+  if (C.drift && !anchor.box) {              // wander a pixel or two each minute so it can't burn into the screen
+    const m = now.getHours() * 60 + now.getMinutes();
+    x += Math.round(Math.sin(m * .7) * 2 * s); y += Math.round(Math.cos(m * .45) * 1.5 * s);
+  }
+  const rect = (px, py, rw, rh) => g.fillRect((x + px) * unit, (y + py) * unit, rw * unit, rh * unit);
+  if (anchor.box) {                          // a little bedside-clock case
+    const p = 2 * s;
+    g.fillStyle = C.colors.box; rect(-p, -p, w + p * 2, h + p * 2);
+    g.fillStyle = 'rgba(255,255,255,.1)'; rect(-p, -p, w + p * 2, 1);
+    g.fillStyle = 'rgba(0,0,0,.45)'; rect(-p, h + p - 1, w + p * 2, 1);
+  }
+  if (C.glow > 0) {
+    g.globalAlpha = .16 * C.glow; g.fillStyle = C.colors.glow;
+    for (const [px, py] of L.on) rect(px * s - s, py * s - s, s * 3, s * 3);
+  }
+  g.fillStyle = C.colors.text;
+  if (L.off.length) { g.globalAlpha = .1; for (const [px, py] of L.off) rect(px * s, py * s, s, s); }
+  g.globalAlpha = 1;
+  for (const [px, py] of L.on) rect(px * s, py * s, s, s);
+}
+
+// A fixed clock position: a corner or the middle of the top or bottom edge
+function clockCorner(pos, W, H, margin) {
+  const top = !pos.startsWith('bottom');
+  const align = pos.endsWith('left') ? 'left' : pos.endsWith('right') ? 'right' : 'center';
+  return { x: align === 'left' ? margin : align === 'right' ? W - margin : Math.round(W / 2),
+    y: top ? margin : H - margin, align, valign: top ? 'top' : 'bottom' };
+}
+// The scene's own spot when position is 'auto', otherwise the chosen corner
+function clockAnchor(auto, W, H, k) {
+  const pos = CFG.clock.position;
+  const a = pos === 'auto' ? auto : clockCorner(pos, W, H, Math.round(8 * k));
+  return { ...a, scale: k, box: pos === 'auto' && auto.box };
+}
+
+/* ------------------------------------------------------------------
+ * App: sizing, seed, resize, input
+ * ------------------------------------------------------------------ */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const buf = makeCanvas(1, 1), bctx = buf.getContext('2d');
+let seed = parseSeed(), scene = null, lastTick = 0;
+
+function parseSeed() {
+  if (Number.isFinite(CFG.display.seed)) return CFG.display.seed >>> 0;
+  const n = parseInt(location.hash.slice(1), 10);
+  return Number.isFinite(n) ? n >>> 0 : (Math.random() * 2 ** 32) >>> 0;
+}
+
+function setup() {
+  const dpr = window.devicePixelRatio || 1;
+  const cw = Math.max(1, Math.floor(innerWidth * dpr)), ch = Math.max(1, Math.floor(innerHeight * dpr));
+  canvas.width = cw; canvas.height = ch;
+  const px = Math.max(1, Math.round(Math.min(cw, ch) / CFG.display.targetRows));
+  const W = Math.ceil(cw / px), H = Math.ceil(ch / px);
+  buf.width = W; buf.height = H;
+  scene = generateScene(seed, W, H);
+  scene.px = px;
+  const now = performance.now();
+  scene.lastRoll = scene.lastSantaRoll = lastTick = now;
+  // pre-fill the smoke so the chimney isn't bare at the start
+  if (CFG.smoke.amount > 0) for (let a = 0; a < 9000; a += 300 / CFG.smoke.amount) addSmoke(scene, now - a);
+  history.replaceState(null, '', '#' + seed);
+  draw(now);
+}
+
+function addSmoke(S, t) {
+  const c = S.cabin.chimney;
+  S.smoke.push({ x: c.x + (Math.random() - .5) * 2 * S.k, y: c.y, born: t, drift: CFG.snowfall.wind + (Math.random() - .3) * .4, ph: Math.random() * TAU });
+}
+
+function tick(S, t) {
+  const dt = Math.min(200, t - lastTick); lastTick = t;
+  if (CFG.smoke.amount > 0 && t - S.lastSmoke > 300 / CFG.smoke.amount) { S.lastSmoke = t; addSmoke(S, t); }
+  const A = CFG.animals;
+  if (t - S.lastRoll > A.everySeconds * 1000) {
+    S.lastRoll = t;
+    if (Math.random() < A.chance && S.animals.length < 2) spawnAnimal(S, t);
+  }
+  if (t - S.lastSantaRoll > CFG.santa.everyMinutes * 60000) {
+    S.lastSantaRoll = t;
+    if (Math.random() < CFG.santa.chance) spawnSanta(S, t);
+  }
+  S.animals = S.animals.filter(a => {
+    if (a.state === 'pause') { if (t > a.until) a.state = 'walk'; return true; }
+    const step = a.v * dt / 1000 * (a.right ? 1 : -1);
+    a.x += step; a.dist += Math.abs(step);
+    if (a.dist >= 3 * S.ps) {                      // leave a print
+      a.dist = 0;
+      S.tracks.push({ x: Math.round(a.x + a.w * (a.right ? .3 : .6)), y: a.y + 1, t });
+      if (S.tracks.length > 600) S.tracks.shift();
+    }
+    if (a.def.pause && Math.random() < dt / 1000 / 12 && a.x > 0 && a.x < S.W - a.w) { a.state = 'pause'; a.until = t + 2500 + Math.random() * 4000; }
+    return a.x > -a.w - 6 && a.x < S.W + 6;
+  });
+}
+
+function draw(t) {
+  tick(scene, t);
+  render(bctx, scene, t);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(buf, 0, 0, scene.W * scene.px, scene.H * scene.px);
+}
+
+let lastDraw = -Infinity;
+function loop(t) {
+  requestAnimationFrame(loop);
+  if (FRAME_INTERVAL) {
+    if (t - lastDraw < FRAME_INTERVAL - 1.5) return;
+    lastDraw = Math.max(lastDraw + FRAME_INTERVAL, t - FRAME_INTERVAL);
+  }
+  draw(t);
+}
+
+function regenerate() { seed = (Math.random() * 2 ** 32) >>> 0; setup(); }
+
+let resizeTimer = 0;
+addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(setup, 100); });
+if (CFG.display.clickToRegenerate) canvas.addEventListener('click', regenerate);
+else canvas.style.cursor = 'default';
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase(), now = performance.now();
+  if (k === 'r' && CFG.display.clickToRegenerate) regenerate();
+  if (k === 'd') spawnAnimal(scene, now, 'deer');
+  if (k === 'f') spawnAnimal(scene, now, 'fox');
+  if (k === 'a') scene.aurora = !scene.aurora;
+  // X = this scene's rare visitor (Shift+X = its variation, where it has one)
+  if (k === 'x') spawnSanta(scene, now);
+  if (!CFG.display.animate) draw(now);
+});
+
+setup();
+if (CFG.display.animate) requestAnimationFrame(loop);
+
+window.cabin = { get scene() { return scene; }, draw, setup, regenerate, spawnAnimal, spawnSanta };
+</script>
+</body>
+</html>

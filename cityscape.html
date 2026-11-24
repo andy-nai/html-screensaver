@@ -1096,7 +1096,15 @@ function spawnCar(scene, t, lane = Math.random() < .5 ? 0 : 1) {
 function updateCars(scene, t) {
   for (const c of scene.cars) if (!c.held) c.x = c.x0 + c.dir * c.speed * (t - c.t0) / 1000;
   scene.cars = scene.cars.filter(c => (c.dir > 0 ? c.x < scene.W + 1 : c.x > -c.img.width - 1));
-  if (scene.carNext === undefined) scene.carNext = t + Math.random() * CAR_EVERY;
+  if (scene.carNext === undefined) {
+    // a new city starts with a car already partway along the road, so
+    // something's moving straight away rather than after a long wait
+    if (spawnCar(scene, t)) {
+      const c = scene.cars[scene.cars.length - 1];
+      c.x0 = c.x = Math.random() * Math.max(1, scene.W - c.img.width);
+    }
+    scene.carNext = t + CAR_EVERY * (.5 + Math.random());
+  }
   if (t >= scene.carNext) {
     scene.carNext = t + CAR_EVERY * (.5 + Math.random());
     if (Math.random() < CFG.cars.chance) spawnCar(scene, t);
@@ -1160,7 +1168,13 @@ function spawnPedestrian(scene, t) {
 function updatePedestrians(scene, t) {
   for (const p of scene.peds) if (!p.held) p.x = p.x0 + p.dir * p.speed * (t - p.t0) / 1000;
   scene.peds = scene.peds.filter(p => (p.dir > 0 ? p.x < scene.W + 1 : p.x > -4));
-  if (scene.pedNext === undefined) scene.pedNext = t + Math.random() * PED_EVERY;
+  if (scene.pedNext === undefined) {
+    // …and someone already out for a walk
+    spawnPedestrian(scene, t);
+    const p = scene.peds[scene.peds.length - 1];
+    p.x0 = p.x = 4 + Math.random() * Math.max(1, scene.W - 11);
+    scene.pedNext = t + PED_EVERY * (.5 + Math.random());
+  }
   if (t >= scene.pedNext) {
     scene.pedNext = t + PED_EVERY * (.5 + Math.random());
     if (Math.random() < CFG.pedestrians.chance) spawnPedestrian(scene, t);
@@ -1170,7 +1184,9 @@ function updatePedestrians(scene, t) {
 function drawPedestrians(ctx, scene, t, px) {
   const peds = [...scene.peds].sort((a, b) => a.feet - b.feet); // further back first
   for (const p of peds) {
-    const walked = p.speed * ((p.held ? p.heldAt : t) - p.t0) / 1000;
+    // clamp: a frame's timestamp can be a hair earlier than the moment this
+    // person was created, which would otherwise pick a walking frame of -1
+    const walked = Math.max(0, p.speed * ((p.held ? p.heldAt : t) - p.t0) / 1000);
     const img = p.frames[p.held ? 1 : Math.floor(walked / 1.5) % 2]; // a step every 1.5 art px
     ctx.globalAlpha = p.alpha;
     ctx.drawImage(img, Math.round(p.x * px), Math.round((p.y - p.lift) * px), img.width * px, img.height * px);

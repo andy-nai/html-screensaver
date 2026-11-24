@@ -56,7 +56,6 @@ const DEFAULTS = {
     },
   },
   santa: {
-    everyMinutes: 15, chance: .15,
     colors: {
       suit: '#d82828', trim: '#f4f4f4', face: '#f0c8a0', sack: '#8a5a30',
       sleigh: '#b01c1c', gold: '#e8c040', reindeer: '#7a5236', antlers: '#c8b090', nose: '#ff3030',
@@ -79,6 +78,10 @@ function mergeConfig(base, over, path = '') {
 }
 const CFG = mergeConfig(DEFAULTS, window.CABIN_CONFIG);
 const FRAME_INTERVAL = CFG.display.frameRate > 0 ? 1000 / CFG.display.frameRate : 0;
+
+// Rare visitors: checked once a minute with a 1-in-30 chance, so about once every 30 minutes but
+// never predictably. When a visitor has a variant (Shift+X), 1 visit in 10 is the variant.
+const RARE_CHECK_MS = 60 * 1000, RARE_CHANCE = 1 / 30, RARE_VARIANT = 1 / 10;
 
 /* ------------------------------------------------------------------
  * Helpers: RNG, colour, dithering, noise
@@ -434,20 +437,43 @@ function makeSantaSprites() {
 }
 function mixRgb(hex, f) { const c = hexRgb(hex); return css(c.map(v => v * f)); }
 
-function spawnSanta(S, t) {
+// The variant: the sleigh slows to a stop over the cabin, a present drops down the chimney (a puff of
+// smoke, the windows flare up), and then it flies on.
+const SANTA_HOVER_MS = 3400, PRESENT_DROP_MS = 900;
+function spawnSanta(S, t, present = Math.random() < RARE_VARIANT) {
   if (S.santa) return;
   S.santaSprites = S.santaSprites || makeSantaSprites();
-  const right = Math.random() < .5, sw = S.santaSprites.w * S.ps;
-  // fly across the moon when there is one
-  const y = S.moon ? S.moon.y - 6 * S.ps : S.hz * (.15 + Math.random() * .2);
-  S.santa = { right, x0: right ? -sw - 4 : S.W + 4, y, t0: t, vx: (right ? 1 : -1) * 24 * S.k / 1000, sw };
+  const sp = S.santaSprites, ps = S.ps, right = Math.random() < .5, sw = sp.w * ps;
+  const speed = 24 * S.k / 1000, x0 = right ? -sw - 4 : S.W + 4;
+  const s = { right, x0, t0: t, vx: (right ? 1 : -1) * speed, sw, present };
+  if (present) {
+    // hover with the sack (sprite column ~2.5, rows 4-6) just above the chimney
+    const ch = S.cabin.chimney, sackCol = right ? 2.5 : sp.w - 3.5;
+    s.y = ch.y - Math.round(24 * S.k) - 6 * ps;
+    s.xs = ch.x - sackCol * ps;
+    s.arrive = Math.abs(s.xs - x0) / speed * 1.4;       // easing in to the stop takes a little longer
+  } else {
+    // fly across the moon when there is one
+    s.y = S.moon ? S.moon.y - 6 * ps : S.hz * (.15 + Math.random() * .2);
+  }
+  S.santa = s;
+}
+
+function santaX(s, age) {
+  if (!s.present) return s.x0 + s.vx * age;
+  if (age < s.arrive) return s.x0 + (s.xs - s.x0) * Math.sin(age / s.arrive * Math.PI / 2);   // slowing to a stop
+  const a2 = age - s.arrive - SANTA_HOVER_MS;
+  if (a2 < 0) return s.xs;                                                                  // hovering
+  return s.xs + s.vx * (a2 < 1200 ? a2 * a2 / 2400 : 600 + (a2 - 1200));                  // pulling away
 }
 
 function drawSanta(b, S, t) {
-  const s = S.santa, sp = S.santaSprites, ps = S.ps;
-  const x = s.x0 + s.vx * (t - s.t0);
-  if (x < -s.sw - 40 * S.k || x > S.W + 40 * S.k) { S.santa = null; return; }
+  const s = S.santa, sp = S.santaSprites, ps = S.ps, age = t - s.t0;
+  const x = santaX(s, age);
+  const leaving = !s.present || age > s.arrive + SANTA_HOVER_MS;
+  if (leaving && (x < -s.sw - 40 * S.k || x > S.W + 40 * S.k)) { S.santa = null; return; }
   const y = Math.round(s.y + Math.sin(t * .0012) * 2 * S.k);
+  if (s.present) drawPresent(b, S, s, age, y);
   const frame = Math.floor(t / 220) % 2;
   // a trail of sparkles behind the sleigh
   const tailX = s.right ? x : x + s.sw;
@@ -467,6 +493,26 @@ function drawSanta(b, S, t) {
   const on = .6 + .4 * Math.sin(t * .008);
   b.fillStyle = CFG.santa.colors.nose; b.fillRect(nX, nY, ps, ps);
   glow(b, nX, nY, 4 * S.k, CFG.santa.colors.nose, .6 * on);
+}
+
+// The present falling from the sack into the chimney; when it lands, smoke puffs and the windows flare
+function drawPresent(b, S, s, age, sleighY) {
+  const p = (age - s.arrive - 500) / PRESENT_DROP_MS;
+  if (p < 0) return;
+  const ch = S.cabin.chimney, ps = S.ps, sz = 2 * ps;
+  if (p >= 1) {
+    if (!s.landed) {
+      s.landed = true;
+      S.flareT = s.t0 + s.arrive + 500 + PRESENT_DROP_MS;
+      for (let i = 0; i < 6; i++) addSmoke(S, S.flareT - i * 60);
+    }
+    return;
+  }
+  const top = sleighY + 6 * ps, y = Math.round(top + (ch.y - top) * p * p);
+  b.fillStyle = '#d8283a'; b.fillRect(Math.round(ch.x - sz / 2), y, sz + 1, sz + 1);
+  b.fillStyle = CFG.santa.colors.gold;
+  b.fillRect(Math.round(ch.x - sz / 2) + ps, y, Math.max(1, ps >> 1) || 1, sz + 1);       // ribbon
+  b.fillRect(Math.round(ch.x - sz / 2), y + ps, sz + 1, Math.max(1, ps >> 1) || 1);
 }
 
 function spawnAnimal(S, t, kind) {
@@ -524,16 +570,18 @@ function render(b, S, t) {
     for (const [cx, cy] of m.craters) b.fillRect(Math.round(m.x + cx * m.r), Math.round(m.y + cy * m.r), Math.max(1, Math.round(m.r / 4)), Math.max(1, Math.round(m.r / 4)));
   }
 
+  b.drawImage(S.land, 0, 0);
+
+  // Santa flies in front of the mountains (low enough, when delivering, to reach the chimney)
   if (S.santa || S.sparkle.length) {
     if (S.santa) drawSanta(b, S, t);
     else { S.sparkle = S.sparkle.filter(p => t - p.t < 1600); }
   }
 
-  b.drawImage(S.land, 0, 0);
-
-  // firelight in the windows, spilling onto the snow
+  // firelight in the windows, spilling onto the snow (flaring up for a moment when a present arrives)
   const C = S.cabin, CC = CFG.cabin.colors, fl = CFG.cabin.flicker;
-  const flick = 1 - fl * (.5 + .25 * Math.sin(t * .0071 + C.ph) + .15 * Math.sin(t * .0193) + .1 * Math.sin(t * .041 + 2));
+  const flare = S.flareT && t > S.flareT ? Math.exp(-(t - S.flareT) / 1200) : 0;
+  const flick = Math.min(1, 1 - fl * (.5 + .25 * Math.sin(t * .0071 + C.ph) + .15 * Math.sin(t * .0193) + .1 * Math.sin(t * .041 + 2)) + flare);
   for (const wd of C.windows) {
     const a = wd.dim ? .6 * flick : flick;
     b.fillStyle = CC.windowGlow; b.fillRect(wd.x, wd.y, wd.w, wd.h);
@@ -544,12 +592,12 @@ function render(b, S, t) {
       // light on the snow below
       for (let r = 0; r < 10 * k; r++) {
         const y = C.groundY + 1 + r, spread = Math.round(r * .8);
-        b.globalAlpha = .22 * flick * (1 - r / (10 * k));
+        b.globalAlpha = (.22 * flick + .3 * flare) * (1 - r / (10 * k));
         b.fillStyle = CC.windowGlow; b.fillRect(wd.x - spread, y, wd.w + spread * 2, 1);
       }
       b.globalAlpha = 1;
     }
-    glow(b, wd.x + wd.w / 2, wd.y + wd.h / 2, wd.w * 1.4, CC.windowGlow, .25 * a);
+    glow(b, wd.x + wd.w / 2, wd.y + wd.h / 2, wd.w * (1.4 + 2 * flare), CC.windowGlow, .25 * a + .4 * flare);
   }
   glow(b, C.lantern.x, C.lantern.y, 6 * k, CC.lantern, .5 * flick);
   b.fillStyle = CC.lantern; b.fillRect(C.lantern.x, C.lantern.y, Math.max(1, Math.round(k)), Math.max(2, Math.round(2 * k)));
@@ -768,9 +816,9 @@ function tick(S, t) {
     S.lastRoll = t;
     if (Math.random() < A.chance && S.animals.length < 2) spawnAnimal(S, t);
   }
-  if (t - S.lastSantaRoll > CFG.santa.everyMinutes * 60000) {
+  if (t - S.lastSantaRoll > RARE_CHECK_MS) {
     S.lastSantaRoll = t;
-    if (Math.random() < CFG.santa.chance) spawnSanta(S, t);
+    if (Math.random() < RARE_CHANCE) spawnSanta(S, t);
   }
   S.animals = S.animals.filter(a => {
     if (a.state === 'pause') { if (t > a.until) a.state = 'walk'; return true; }
@@ -816,7 +864,7 @@ addEventListener('keydown', e => {
   if (k === 'f') spawnAnimal(scene, now, 'fox');
   if (k === 'a') scene.aurora = !scene.aurora;
   // X = this scene's rare visitor (Shift+X = its variation, where it has one)
-  if (k === 'x') spawnSanta(scene, now);
+  if (k === 'x') spawnSanta(scene, now, e.shiftKey || undefined);
   if (!CFG.display.animate) draw(now);
 });
 

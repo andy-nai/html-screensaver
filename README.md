@@ -6,7 +6,7 @@ built into Windows 11 and most up-to-date Windows 10 machines.
 
 ## Install
 
-Run `HtmlScreensaver-Setup.exe`. It installs for your account only (no admin rights needed) and sets
+Download `HtmlScreensaver-Setup.exe` from the latest [release](../../releases/latest) and run it. It installs for your account only (no admin rights needed) and sets
 HTML Screensaver as your screensaver. Then choose the wait time in Windows' Screen Saver Settings,
 which the installer offers to open.
 
@@ -57,6 +57,7 @@ Layout of the source tree:
 
 ```
 src\screensaver\     C# project: the screensaver and its built-in installer
+.github\workflows\   release.yml, builds and publishes the installer
 scenes\              scenes, bundled into the installer
 build.ps1            builds dist\HtmlScreensaver-Setup.exe
 ```
@@ -74,6 +75,13 @@ screensaver are the same program: named `*.scr` it's the screensaver, under any 
 itself. `/quiet` skips the installer's dialogs, and `/uninstall` removes it.
 
 The only third-party dependency is the `Microsoft.Web.WebView2` NuGet package, which is compiled into the exe.
+
+### Releases
+
+Every push to `main` builds the installer on GitHub Actions (`.github\workflows\release.yml`) and publishes
+it as the release `v<version>`. The version is `<Version>` in `src\screensaver\HtmlScreensaver.csproj`; it's
+also what the installer and Installed apps show. Bump it to make a new release. Pushes without a bump
+replace the current release's installer.
 
 The installer isn't code-signed, so Windows SmartScreen may warn about it the first time it runs
 (*More info > Run anyway*).
